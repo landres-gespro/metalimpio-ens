@@ -2865,7 +2865,6 @@ async function stripPdf(f, opts) {
   };
 }
 
-
 /* ── OFFICE / ODF (v14 — eliminación real de comentarios y revisiones) ── */
 async function stripOffice(f, opts){
 const ab=await f.file.arrayBuffer();
@@ -2897,10 +2896,10 @@ return open.slice(0,-1)+'/>';
 return o;
 }
 
-const cf=zip.file('docProps/core.xml');
+const coreFile=zip.file('docProps/core.xml');
 const beforeFields={};
-if(cf){
-const rawCore=await cf.async('string');
+if(coreFile){
+const rawCore=await coreFile.async('string');
 const coreTagMap={
 'dc:creator':'Autor','cp:lastModifiedBy':'Último modificador',
 'lastModifiedBy':'Último modificador',
@@ -2919,8 +2918,8 @@ beforeFields[label]=m[1].trim().substring(0,120);
 }
 }
 
-if(cf){
-let x=await cf.async('string');
+if(coreFile){
+let x=await coreFile.async('string');
 x=blankField(x,coreFields);
 x=x.replace(/<(?:cp:)?revision>[^<]*<\/(?:cp:)?revision>/g,
 m => m.startsWith('<cp:') ? '<cp:revision>1</cp:revision>' : '<revision>1</revision>');
@@ -2941,9 +2940,9 @@ const appF2 = [];
 if (opts.company)  appF2.push('Company','Manager');
 if (opts.template) appF2.push('Application','AppVersion');
 if (opts.stats)    appF2.push('TotalTime','Pages','Words','Characters','Lines','Paragraphs','CharactersWithSpaces','Slides','Notes','HiddenSlides');
-const af=zip.file('docProps/app.xml');
-if(af){
-const rawApp=await af.async('string');
+const appFile=zip.file('docProps/app.xml');
+if(appFile){
+const rawApp=await appFile.async('string');
 const appTagMap={'Application':'Aplicación','AppVersion':'Versión app',
 'Company':'Empresa','Manager':'Responsable','Template':'Plantilla'};
 for(const [tag,label] of Object.entries(appTagMap)){
@@ -2952,79 +2951,73 @@ if(m&&m[1].trim()) beforeFields[label]=m[1].trim().substring(0,120);
 }
 }
 
-if(af){
-let x=await af.async('string');
+if(appFile){
+let x=await appFile.async('string');
 x=blankField(x,appF2);
 x=x.replace(/<AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
 x=x.replace(/<(?:[a-zA-Z][a-zA-Z0-9_]*:)?AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
 const numericFields=['TotalTime','Pages','Words','Characters','Lines','Paragraphs',
 'CharactersWithSpaces','Slides','Notes','HiddenSlides','MMClips',
 'PresentationFormat'];
-for(const f of numericFields){
-x=x.replace(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${f}\\/>`, 'g'),
-`<${f}>0</${f}>`);
+for(const nf of numericFields){
+x=x.replace(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${nf}\\/>`, 'g'),
+`<${nf}>0</${nf}>`);
 }
 zip.file('docProps/app.xml',x);
 }
 
 const cu=zip.file('docProps/custom.xml');
 if(cu&&opts.custom){
-zip.file('docProps/custom.xml','<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>');
+zip.file('docProps/custom.xml','<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>');
 removed+=5; removedFields.push('Propiedades personalizadas (eliminadas)');
 }
 
 // ── FASE 2: Eliminación real de comentarios y revisiones ────────────────
-// Detectar y eliminar archivos de comentarios
 const commentFiles = [
-'word/comments.xml',
-'word/commentsExtended.xml',
-'word/commentsIds.xml',
-'word/commentPeople.xml',
-'xl/comments.xml',
-'xl/comments1.xml',
-'xl/comments2.xml',
-'xl/comments3.xml',
-'ppt/comments.xml',
-'ppt/comments1.xml',
-'ppt/comments2.xml'
+'word/comments.xml','word/commentsExtended.xml',
+'word/commentsIds.xml','word/commentPeople.xml',
+'xl/comments.xml','xl/comments1.xml','xl/comments2.xml','xl/comments3.xml',
+'ppt/comments.xml','ppt/comments1.xml','ppt/comments2.xml'
 ];
 
 let commentsRemoved = false;
-for (const cf of commentFiles) {
-if (zip.file(cf) && opts.comments) {
-zip.remove(cf);
+if (opts.comments) {
+for (const cfPath of commentFiles) {
+if (zip.file(cfPath)) {
+zip.remove(cfPath);
 commentsRemoved = true;
-removedFields.push(`Comentarios eliminados: ${cf}`);
+removedFields.push(`Comentarios eliminados: ${cfPath}`);
+}
 }
 }
 
 // Función para limpiar revisiones de un archivo XML de Office
-function cleanRevisions(xml, opts) {
+function cleanRevisions(xml) {
 if (!opts.comments) return xml;
 let cleaned = xml;
 
 // Eliminar contenido marcado como borrado (w:del)
-// Formato: <w:del w:author="..." w:date="..."><w:r>...</w:r></w:del>
 cleaned = cleaned.replace(/<w:del\s[^>]*>[\s\S]*?<\/w:del>/g, '');
 cleaned = cleaned.replace(/<w:del>[\s\S]*?<\/w:del>/g, '');
 
 // Mantener contenido de inserciones (w:ins) pero eliminar el tag contenedor
-// Formato: <w:ins w:author="..." w:date="..."><w:r>...</w:r></w:ins>
 cleaned = cleaned.replace(/<w:ins\s[^>]*>([\s\S]*?)<\/w:ins>/g, '$1');
 cleaned = cleaned.replace(/<w:ins>([\s\S]*?)<\/w:ins>/g, '$1');
 
 // Eliminar tags de cambio de propiedades (metadatos de revisión)
 const changeTags = [
 'rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange',
-'tcPrChange', 'trPrChange', 'tblGridChange', 'numberingChange'
+'tcPrChange', 'trPrChange', 'tblGridChange', 'numberingChange',
+'sectPrChange', 'rPrOriginal', 'pPrOriginal'
 ];
 
 for (const tag of changeTags) {
-const re = new RegExp(`<w:${tag}\\s[^>]*>[\\s\\S]*?<\\/w:${tag}>`, 'g');
-cleaned = cleaned.replace(re, '');
+const re1 = new RegExp(`<w:${tag}\\s[^>]*>[\\s\\S]*?<\\/w:${tag}>`, 'g');
+cleaned = cleaned.replace(re1, '');
 const re2 = new RegExp(`<w:${tag}>[\\s\\S]*?<\\/w:${tag}>`, 'g');
 cleaned = cleaned.replace(re2, '');
+const re3 = new RegExp(`<w:${tag}\\s[^>]*\\/>`, 'g');
+cleaned = cleaned.replace(re3, '');
 }
 
 // Eliminar atributos de revisión de elementos (rsidR, rsidRPr, rsidDel, etc.)
@@ -3034,70 +3027,71 @@ return cleaned;
 }
 
 // Limpiar revisiones en document.xml (Word)
-const docFiles = ['word/document.xml'];
-for (const df of docFiles) {
-const file = zip.file(df);
-if (file) {
-let xml = await file.async('string');
+const docXmlFile = zip.file('word/document.xml');
+if (docXmlFile && opts.comments) {
+let xml = await docXmlFile.async('string');
 const original = xml;
-xml = cleanRevisions(xml, opts);
+xml = cleanRevisions(xml);
 if (xml !== original) {
-zip.file(df, xml);
-removedFields.push(`Revisiones eliminadas: ${df}`);
-}
+zip.file('word/document.xml', xml);
+removedFields.push('Revisiones eliminadas: word/document.xml');
 }
 }
 
 // Limpiar revisiones en footnotes, endnotes, headers, footers (Word)
-const auxFiles = [
+const auxDocFiles = [
 'word/footnotes.xml', 'word/endnotes.xml',
 'word/header1.xml', 'word/header2.xml', 'word/header3.xml',
-'word/footer1.xml', 'word/footer2.xml', 'word/footer3.xml'
+'word/header4.xml', 'word/header5.xml',
+'word/footer1.xml', 'word/footer2.xml', 'word/footer3.xml',
+'word/footer4.xml', 'word/footer5.xml'
 ];
 
-for (const af of auxFiles) {
-const file = zip.file(af);
-if (file) {
-let xml = await file.async('string');
+if (opts.comments) {
+for (const auxPath of auxDocFiles) {
+const auxFile = zip.file(auxPath);
+if (auxFile) {
+let xml = await auxFile.async('string');
 const original = xml;
-xml = cleanRevisions(xml, opts);
+xml = cleanRevisions(xml);
 if (xml !== original) {
-zip.file(af, xml);
-removedFields.push(`Revisiones eliminadas: ${af}`);
+zip.file(auxPath, xml);
+removedFields.push(`Revisiones eliminadas: ${auxPath}`);
+}
 }
 }
 }
 
 // Limpiar revisiones en Excel (sheets)
+if (opts.comments) {
 const xlSheets = zip.file(/xl\/worksheets\/sheet\d+\.xml/);
 for (const sheet of xlSheets) {
 let xml = await sheet.async('string');
 const original = xml;
-// Excel usa tags diferentes: x:ins, x:del, x:cellMetadata
-xml = xml.replace(/<x:ins\s[^>]*>[\s\S]*?<\/x:ins>/g, '');
-xml = xml.replace(/<x:del\s[^>]*>[\s\S]*?<\/x:del>/g, '');
-xml = xml.replace(/<x:cellMetadata>[\s\S]*?<\/x:cellMetadata>/g, '');
+// Excel usa namespace diferente; limpiar atributos de revisión
+xml = xml.replace(/\s+x:rsid[A-Za-z]*="[^"]*"/g, '');
 if (xml !== original) {
 zip.file(sheet.name, xml);
 removedFields.push(`Revisiones eliminadas: ${sheet.name}`);
 }
 }
+}
 
 // Limpiar revisiones en PowerPoint (slides)
+if (opts.comments) {
 const pptSlides = zip.file(/ppt\/slides\/slide\d+\.xml/);
 for (const slide of pptSlides) {
 let xml = await slide.async('string');
 const original = xml;
-// PowerPoint usa tags similares a Word
-xml = cleanRevisions(xml.replace(/<w:/g, '<a:').replace(/<\/w:/g, '</a:'), opts)
-.replace(/<a:/g, '<w:').replace(/<\/a:/g, '</w:');
+xml = xml.replace(/\s+a:rsid[A-Za-z]*="[^"]*"/g, '');
 if (xml !== original) {
 zip.file(slide.name, xml);
 removedFields.push(`Revisiones eliminadas: ${slide.name}`);
 }
 }
+}
 
-if (commentsRemoved || removedFields.some(f => f.includes('Revisiones eliminadas'))) {
+if (commentsRemoved || removedFields.some(f => f.includes('Revisiones'))) {
 removed += removedFields.filter(f => f.includes('Comentarios') || f.includes('Revisiones')).length;
 }
 
@@ -3121,10 +3115,9 @@ odp:'application/vnd.oasis.opendocument.presentation'};
 const outZip = new JSZip();
 const modifiedFiles = new Set(['docProps/core.xml','docProps/app.xml','docProps/custom.xml',
 'word/document.xml','word/footnotes.xml','word/endnotes.xml',
-'word/header1.xml','word/header2.xml','word/header3.xml',
-'word/footer1.xml','word/footer2.xml','word/footer3.xml']);
+'word/header1.xml','word/header2.xml','word/header3.xml','word/header4.xml','word/header5.xml',
+'word/footer1.xml','word/footer2.xml','word/footer3.xml','word/footer4.xml','word/footer5.xml']);
 
-// Añadir sheets de Excel y slides de PowerPoint a modifiedFiles
 for (const name of Object.keys(zip.files)) {
 if (name.match(/xl\/worksheets\/sheet\d+\.xml/) || name.match(/ppt\/slides\/slide\d+\.xml/)) {
 modifiedFiles.add(name);
@@ -3150,7 +3143,7 @@ return{blob:new Blob([out],{type:mimes[f.ext]||'application/octet-stream'}),
 meta:Math.max(removed,1),warn:hasMacros,
 warnMsg:hasMacros?'Macros VBA detectadas — revisión manual obligatoria':'',
 audit:{removed:removedFields,warnings,beforeFields,
-fields:{'Autor/Modificador':opts.author?'Eliminado':'Omitido','Empresa':opts.company?'Eliminado':'Omitido','Fechas':opts.dates?'Sustituido por fecha de proceso':'Omitido','Propiedades personalizadas':opts.custom?'Eliminadas':'Omitido','Comentarios':opts.comments&&commentsRemoved?'Eliminados':'No eliminados','Revisiones':opts.comments&&removedFields.some(f=>f.includes('Revisiones'))?'Eliminadas':'No eliminadas','Macros VBA':hasMacros?'⚠ Detectadas — revisión manual':'No detectadas','Copyright':'Conservado'}}};
+fields:{'Autor/Modificador':opts.author?'Eliminado':'Omitido','Empresa':opts.company?'Eliminado':'Omitido','Fechas':opts.dates?'Sustituido por fecha de proceso':'Omitido','Propiedades personalizadas':opts.custom?'Eliminadas':'Omitido','Comentarios':opts.comments&&commentsRemoved?'Eliminados':'No eliminados','Revisiones':opts.comments&&removedFields.some(x=>x.includes('Revisiones'))?'Eliminadas':'No eliminadas','Macros VBA':hasMacros?'⚠ Detectadas — revisión manual':'No detectadas','Copyright':'Conservado'}}};
 }
 
 /* ── LEGACY (DOC/XLS) ── */
