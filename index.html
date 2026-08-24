@@ -2968,8 +2968,8 @@ zip.file('docProps/app.xml',x);
 
 const cu=zip.file('docProps/custom.xml');
 if(cu&&opts.custom){
-zip.file('docProps/custom.xml','<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>');
-removed+=5; removedFields.push('Propiedades personalizadas (eliminadas)');
+zip.file('docProps/custom.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>`);
 }
 
 // ── FASE 2: Eliminación real de comentarios y revisiones ────────────────
