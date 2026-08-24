@@ -2982,11 +2982,12 @@ const commentFiles = [
 
 let commentsRemoved = false;
 if (opts.comments) {
-for (const cfPath of commentFiles) {
-if (zip.file(cfPath)) {
-zip.remove(cfPath);
+for (const commentPath of commentFiles) {
+const commentFile = zip.file(commentPath);
+if (commentFile) {
+zip.remove(commentPath);
 commentsRemoved = true;
-removedFields.push(`Comentarios eliminados: ${cfPath}`);
+removedFields.push(`Comentarios eliminados: ${commentPath}`);
 }
 }
 }
@@ -3008,7 +3009,7 @@ cleaned = cleaned.replace(/<w:ins>([\s\S]*?)<\/w:ins>/g, '$1');
 const changeTags = [
 'rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange',
 'tcPrChange', 'trPrChange', 'tblGridChange', 'numberingChange',
-'sectPrChange', 'rPrOriginal', 'pPrOriginal'
+'rPrOriginal', 'pPrOriginal'
 ];
 
 for (const tag of changeTags) {
@@ -3068,7 +3069,6 @@ const xlSheets = zip.file(/xl\/worksheets\/sheet\d+\.xml/);
 for (const sheet of xlSheets) {
 let xml = await sheet.async('string');
 const original = xml;
-// Excel usa namespace diferente; limpiar atributos de revisión
 xml = xml.replace(/\s+x:rsid[A-Za-z]*="[^"]*"/g, '');
 if (xml !== original) {
 zip.file(sheet.name, xml);
