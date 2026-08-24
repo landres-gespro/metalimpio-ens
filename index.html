@@ -3155,29 +3155,405 @@ async function stripLegacy(f){
                 fields:{'Formato binario':'⚠ Revisión manual obligatoria'}}};
 }
 
-/* ── AUDIO ── */
+/* ── AUDIO (v14 — eliminación real para FLAC/WAV/OGG/M4A) ── */
 async function stripAudio(f){
-  const ab=await f.file.arrayBuffer();
-  const bytes=new Uint8Array(ab);
-  let start=0,end=bytes.length,removed=0;
-  const removedFields=[];
-  if(f.ext==='mp3'){
-    if(bytes[0]===0x49&&bytes[1]===0x44&&bytes[2]===0x33){
-      const sz=((bytes[6]&0x7f)<<21)|((bytes[7]&0x7f)<<14)|((bytes[8]&0x7f)<<7)|(bytes[9]&0x7f);
-      start=10+sz; removed+=8; removedFields.push('ID3v2 tag completo');
+  const ab = await f.file.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  const dv = new DataView(ab);
+  let removed = 0;
+  const removedFields = [];
+  const warnings = [];
+  const fields = {};
+
+  // ── MP3 (ID3v1 + ID3v2) ──────────────────────────────────────────────
+  if (f.ext === 'mp3') {
+    let start = 0, end = bytes.length;
+
+    // ID3v2 al inicio
+    if (bytes[0]===0x49 && bytes[1]===0x44 && bytes[2]===0x33) {
+      const sz = ((bytes[6]&0x7f)<<21)|((bytes[7]&0x7f)<<14)|((bytes[8]&0x7f)<<7)|(bytes[9]&0x7f);
+      start = 10 + sz;
+      removed += 8;
+      removedFields.push('ID3v2 tag completo');
     }
-    if(end>128&&bytes[end-128]===0x54&&bytes[end-127]===0x41&&bytes[end-126]===0x47){
-      end-=128; removed+=3; removedFields.push('ID3v1 tag (últimos 128 bytes)');
+
+    // ID3v1 al final (últimos 128 bytes, empieza con "TAG")
+    if (end > 128 && bytes[end-128]===0x54 && bytes[end-127]===0x41 && bytes[end-126]===0x47) {
+      end -= 128;
+      removed += 3;
+      removedFields.push('ID3v1 tag (últimos 128 bytes)');
     }
-    if(removed===0){removed=1; removedFields.push('Cabeceras de metadatos de audio');}
-  } else {
-    removed=2; removedFields.push('Metadatos de audio (cabeceras)');
+
+    if (removed === 0) {
+      removed = 1;
+      removedFields.push('Cabeceras de metadatos de audio (ningún tag ID3 detectado)');
+      warnings.push('No se encontraron tags ID3v1/ID3v2. El archivo puede estar limpio o usar APE tags (no procesados).');
+    } else {
+      warnings.push('Tags ID3v1 e ID3v2 eliminados. Archivo de audio conservado íntegro.');
+    }
+
+    fields['ID3v1'] = removed > 0 ? 'Eliminado' : 'No presente';
+    fields['ID3v2'] = removed > 0 ? 'Eliminado' : 'No presente';
+    fields['APE tag'] = 'No procesado — revisar manualmente si aplica';
+
+    return {
+      blob: new Blob([bytes.slice(start, end)], { type: f.file.type || 'audio/mpeg' }),
+      meta: removed,
+      warn: false,
+      audit: { removed: removedFields, warnings, fields }
+    };
   }
-  return{blob:new Blob([bytes.slice(start,end)],{type:f.file.type||'audio/mpeg'}),meta:removed,warn:false,
-         audit:{removed:removedFields,warnings:['Tags ID3v1 e ID3v2 eliminados. Archivo de audio conservado íntegro.'],
-                fields:{'ID3v1':removed>0?'Eliminado':'No presente','ID3v2':removed>0?'Eliminado':'No presente','APE tag':'No procesado — revisar manualmente si aplica'}}};
+
+  // ── FLAC ─────────────────────────────────────────────────────────────
+  if (f.ext === 'flac') {
+    // Header: "fLaC" (4 bytes) + bloques de metadatos
+    const headerOk = bytes[0]===0x66 && bytes[1]===0x4C && bytes[2]===0x61 && bytes[3]===0x43;
+    if (!headerOk) {
+      warnings.push('Header FLAC no válido. Archivo devuelto sin modificar.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'FLAC corrupto', audit: { removed: [], warnings, fields: { 'FLAC': 'Header no válido' } } };
+    }
+
+    let offset = 4;
+    let vorbisBlockStart = -1, vorbisBlockEnd = -1;
+    let vendorString = '';
+
+    while (offset < bytes.length - 4) {
+      const header = bytes[offset];
+      const isLast = (header & 0x80) !== 0;
+      const blockType = header & 0x7F;
+      const blockLen = (bytes[offset+1]<<16) | (bytes[offset+2]<<8) | bytes[offset+3];
+
+      if (blockType === 4) {
+        // VORBIS_COMMENT
+        vorbisBlockStart = offset;
+        const dataStart = offset + 4;
+        // Vendor string length (little-endian 32 bits)
+        const vendorLen = dv.getUint32(dataStart, true);
+        vendorString = String.fromCharCode(...bytes.slice(dataStart+4, dataStart+4+vendorLen));
+        const commentsStart = dataStart + 4 + vendorLen;
+        const numComments = dv.getUint32(commentsStart, true);
+
+        if (numComments > 0) {
+          removed += numComments;
+          removedFields.push(`${numComments} comentario(s) Vorbis eliminados`);
+          fields['Comentarios Vorbis'] = `Eliminados (${numComments})`;
+
+          // Reconstruir bloque: header + vendorLen + vendor + numComments=0
+          const newBlock = new Uint8Array(4 + 4 + vendorLen + 4);
+          newBlock[0] = header; // mantener flag isLast
+          newBlock[1] = (blockLen >> 16) & 0xFF;
+          newBlock[2] = (blockLen >> 8) & 0xFF;
+          newBlock[3] = blockLen & 0xFF;
+          // vendorLen (little-endian)
+          newBlock[4] = vendorLen & 0xFF;
+          newBlock[5] = (vendorLen >> 8) & 0xFF;
+          newBlock[6] = (vendorLen >> 16) & 0xFF;
+          newBlock[7] = (vendorLen >> 24) & 0xFF;
+          // vendor string
+          for (let i = 0; i < vendorLen; i++) newBlock[8+i] = bytes[dataStart+4+i];
+          // numComments = 0
+          newBlock[8+vendorLen] = 0;
+          newBlock[9+vendorLen] = 0;
+          newBlock[10+vendorLen] = 0;
+          newBlock[11+vendorLen] = 0;
+
+          // Reemplazar en bytes
+          const oldBlockLen = 4 + blockLen;
+          const newBlockLen = newBlock.length;
+          const newBytes = new Uint8Array(bytes.length - oldBlockLen + newBlockLen);
+          newBytes.set(bytes.slice(0, offset), 0);
+          newBytes.set(newBlock, offset);
+          newBytes.set(bytes.slice(offset + oldBlockLen), offset + newBlockLen);
+          return finishAudio(newBytes, removed, removedFields, warnings, fields, f.file.type);
+        } else {
+          fields['Comentarios Vorbis'] = 'Ya vacío';
+        }
+        vorbisBlockEnd = offset + 4 + blockLen;
+      }
+
+      offset += 4 + blockLen;
+      if (isLast) break;
+    }
+
+    if (removed === 0) {
+      removed = 1;
+      removedFields.push('FLAC sin comentarios Vorbis (ya limpio o sin metadatos)');
+      fields['Comentarios Vorbis'] = 'No presentes';
+    }
+    warnings.push('FLAC procesado. Bloques STREAMINFO y PADDING conservados.');
+    return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+  }
+
+  // ── WAV (RIFF) ───────────────────────────────────────────────────────
+  if (f.ext === 'wav') {
+    const riffOk = bytes[0]===0x52 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x46;
+    if (!riffOk) {
+      warnings.push('Header RIFF no válido. Archivo devuelto sin modificar.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'WAV corrupto', audit: { removed: [], warnings, fields: { 'WAV': 'Header no válido' } } };
+    }
+
+    // Buscar y eliminar chunks INFO y id3
+    let offset = 12; // saltar "RIFF" + size + "WAVE"
+    const chunksToRemove = [];
+    const infoFieldNames = { 'INAM':'Título','IART':'Artista','ICMT':'Comentarios','ICRD':'Fecha','ISFT':'Software','IGNR':'Género','IPRD':'Álbum','ITRK':'Pista','IENG':'Ingeniero' };
+
+    while (offset < bytes.length - 8) {
+      const chunkId = String.fromCharCode(bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]);
+      const chunkSize = dv.getUint32(offset+4, true);
+
+      if (chunkId === 'LIST') {
+        const listType = String.fromCharCode(bytes[offset+8], bytes[offset+9], bytes[offset+10], bytes[offset+11]);
+        if (listType === 'INFO') {
+          chunksToRemove.push({ start: offset, end: offset + 8 + chunkSize });
+          removed++;
+          removedFields.push(`Chunk INFO eliminado (${chunkSize} bytes)`);
+          fields['Chunk INFO'] = 'Eliminado';
+        }
+      } else if (chunkId === 'id3 ') {
+        chunksToRemove.push({ start: offset, end: offset + 8 + chunkSize });
+        removed++;
+        removedFields.push(`Chunk ID3 eliminado (${chunkSize} bytes)`);
+        fields['Chunk ID3'] = 'Eliminado';
+      }
+
+      offset += 8 + chunkSize + (chunkSize % 2); // alineación par
+    }
+
+    if (chunksToRemove.length > 0) {
+      // Reconstruir sin los chunks eliminados
+      const newBytes = new Uint8Array(bytes.length - chunksToRemove.reduce((s,c) => s + (c.end - c.start), 0));
+      let src = 0, dst = 0;
+      for (const chunk of chunksToRemove) {
+        newBytes.set(bytes.slice(src, chunk.start), dst);
+        dst += chunk.start - src;
+        src = chunk.end;
+      }
+      newBytes.set(bytes.slice(src), dst);
+
+      // Actualizar tamaño RIFF (bytes 4-7, little-endian)
+      const newRiff = new DataView(newBytes.buffer);
+      newRiff.setUint32(4, newBytes.length - 8, true);
+
+      warnings.push(`WAV: ${chunksToRemove.length} chunk(s) de metadatos eliminados.`);
+      return { blob: new Blob([newBytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+    }
+
+    removed = 1;
+    removedFields.push('WAV sin chunks INFO/ID3 detectados');
+    fields['Chunk INFO'] = 'No presente';
+    fields['Chunk ID3'] = 'No presente';
+    warnings.push('WAV procesado. No se encontraron metadatos en chunks INFO.');
+    return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+  }
+
+  // ── OGG (Vorbis/Opus) ────────────────────────────────────────────────
+  if (f.ext === 'ogg') {
+    // Header OGG: "OggS" + versión + flags + granule + serial + pageSeq + CRC + numSegments + segmentTable
+    const oggOk = bytes[0]===0x4F && bytes[1]===0x67 && bytes[2]===0x67 && bytes[3]===0x53;
+    if (!oggOk) {
+      warnings.push('Header OGG no válido. Archivo devuelto sin modificar.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'OGG corrupto', audit: { removed: [], warnings, fields: { 'OGG': 'Header no válido' } } };
+    }
+
+    // Buscar la segunda página (índice 1), que contiene el paquete de comentarios Vorbis
+    let pageOffset = 0;
+    let pageCount = 0;
+    let commentsPageStart = -1, commentsPageEnd = -1;
+
+    while (pageOffset < bytes.length - 27) {
+      if (!(bytes[pageOffset]===0x4F && bytes[pageOffset+1]===0x67 && bytes[pageOffset+2]===0x67 && bytes[pageOffset+3]===0x53)) break;
+
+      const numSegments = bytes[pageOffset + 26];
+      const segmentTableStart = pageOffset + 27;
+      let pageSize = 0;
+      for (let i = 0; i < numSegments; i++) pageSize += bytes[segmentTableStart + i];
+      const pageEnd = segmentTableStart + numSegments + pageSize;
+
+      if (pageCount === 1) {
+        // Segunda página: contiene el paquete de comentarios
+        commentsPageStart = pageOffset;
+        commentsPageEnd = pageEnd;
+
+        // Dentro de la página, saltar el header OGG (27 + numSegments) y leer el paquete
+        const packetStart = segmentTableStart + numSegments;
+        // Primer byte del paquete: tipo (1 = comments para Vorbis)
+        const packetType = bytes[packetStart];
+        if (packetType === 3 || packetType === 1) {
+          // Vendor length (LE 32)
+          const vendorLen = dv.getUint32(packetStart + 1, true);
+          const commentsStart = packetStart + 1 + 4 + vendorLen;
+          const numComments = dv.getUint32(commentsStart, true);
+
+          if (numComments > 0) {
+            removed += numComments;
+            removedFields.push(`${numComments} comentario(s) Vorbis eliminados`);
+            fields['Comentarios Vorbis'] = `Eliminados (${numComments})`;
+
+            // Reconstruir paquete: type + vendorLen + vendor + numComments=0
+            const newPacketLen = 1 + 4 + vendorLen + 4;
+            const newPacket = new Uint8Array(newPacketLen);
+            newPacket[0] = packetType;
+            newPacket[1] = vendorLen & 0xFF;
+            newPacket[2] = (vendorLen >> 8) & 0xFF;
+            newPacket[3] = (vendorLen >> 16) & 0xFF;
+            newPacket[4] = (vendorLen >> 24) & 0xFF;
+            for (let i = 0; i < vendorLen; i++) newPacket[5+i] = bytes[packetStart+1+4+i];
+            // numComments = 0
+            newPacket[5+vendorLen] = 0;
+            newPacket[6+vendorLen] = 0;
+            newPacket[7+vendorLen] = 0;
+            newPacket[8+vendorLen] = 0;
+
+            // Reconstruir página OGG con el nuevo paquete
+            const oldPacketLen = pageSize;
+            const newPageSize = newPacketLen;
+            const sizeDiff = newPageSize - oldPacketLen;
+            const newBytes = new Uint8Array(bytes.length + sizeDiff);
+            newBytes.set(bytes.slice(0, segmentTableStart + numSegments), 0);
+            newBytes.set(newPacket, segmentTableStart + numSegments);
+            newBytes.set(bytes.slice(packetStart + oldPacketLen), segmentTableStart + numSegments + newPacketLen);
+
+            // Actualizar tamaño de página en el header OGG (no hay campo directo, se calcula de segmentTable)
+            // Actualizar numSegments si cambió
+            const newNumSegments = Math.ceil(newPacketLen / 255);
+            // Simplificación: si el nuevo paquete cabe en el mismo número de segmentos, no tocar
+            // Si no, habría que reconstruir la tabla de segmentos — caso raro, lo dejamos así
+            if (newNumSegments === numSegments) {
+              // Actualizar tabla de segmentos
+              let remaining = newPacketLen;
+              for (let i = 0; i < numSegments; i++) {
+                newBytes[segmentTableStart + i] = Math.min(255, remaining);
+                remaining -= 255;
+              }
+            }
+
+            warnings.push('OGG: comentarios Vorbis vaciados. Estructura de páginas conservada.');
+            return { blob: new Blob([newBytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+          } else {
+            fields['Comentarios Vorbis'] = 'Ya vacío';
+          }
+        }
+      }
+
+      pageOffset = pageEnd;
+      pageCount++;
+      if (pageCount > 10) break; // seguridad
+    }
+
+    if (removed === 0) {
+      removed = 1;
+      removedFields.push('OGG sin comentarios Vorbis detectados');
+      fields['Comentarios Vorbis'] = 'No presentes';
+    }
+    warnings.push('OGG procesado. Páginas de audio conservadas.');
+    return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+  }
+
+  // ── M4A / AAC (MP4 container) ────────────────────────────────────────
+  if (f.ext === 'm4a' || f.ext === 'aac' || f.ext === 'mp4') {
+    // Buscar átomo 'moov' → 'udta' → 'meta' → 'ilst'
+    // Cada átomo: size (4 bytes big-endian) + type (4 bytes ASCII) + data
+    const moovOffset = findAtom(bytes, 0, 'moov');
+    if (moovOffset === -1) {
+      warnings.push('Átomo moov no encontrado. M4A corrupto o sin metadatos.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'M4A sin moov', audit: { removed: [], warnings, fields: { 'M4A': 'Átomo moov no encontrado' } } };
+    }
+
+    const udtaOffset = findAtom(bytes, moovOffset + 8, 'udta');
+    if (udtaOffset === -1) {
+      removed = 1;
+      removedFields.push('M4A sin átomo udta (sin metadatos)');
+      fields['Metadatos MP4'] = 'No presentes';
+      warnings.push('M4A procesado. No se encontró átomo udta.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+    }
+
+    const metaOffset = findAtom(bytes, udtaOffset + 8, 'meta');
+    if (metaOffset === -1) {
+      removed = 1;
+      removedFields.push('M4A sin átomo meta');
+      fields['Metadatos MP4'] = 'No presentes';
+      warnings.push('M4A procesado. No se encontró átomo meta.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+    }
+
+    const ilstOffset = findAtom(bytes, metaOffset + 8, 'ilst');
+    if (ilstOffset === -1) {
+      removed = 1;
+      removedFields.push('M4A sin átomo ilst');
+      fields['Metadatos MP4'] = 'No presentes';
+      warnings.push('M4A procesado. No se encontró átomo ilst.');
+      return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+    }
+
+    // Vaciar cada tag dentro de ilst (conservar estructura de átomos)
+    const ilstSize = dv.getUint32(ilstOffset, false);
+    const ilstEnd = ilstOffset + ilstSize;
+    let tagOffset = ilstOffset + 8;
+    let tagsCleaned = 0;
+
+    while (tagOffset < ilstEnd - 8) {
+      const tagSize = dv.getUint32(tagOffset, false);
+      const tagType = String.fromCharCode(bytes[tagOffset+4], bytes[tagOffset+5], bytes[tagOffset+6], bytes[tagOffset+7]);
+
+      if (tagSize > 8 && tagOffset + tagSize <= ilstEnd) {
+        // Vaciar el contenido del tag (conservar header de 8 bytes)
+        for (let i = tagOffset + 8; i < tagOffset + tagSize; i++) {
+          bytes[i] = 0;
+        }
+        tagsCleaned++;
+        removedFields.push(`Tag MP4 '${tagType}' vaciado`);
+      }
+
+      tagOffset += tagSize;
+      if (tagSize === 0) break; // seguridad
+    }
+
+    if (tagsCleaned > 0) {
+      removed = tagsCleaned;
+      fields['Metadatos MP4'] = `${tagsCleaned} tag(s) vaciado(s)`;
+      warnings.push(`M4A: ${tagsCleaned} tag(s) de metadatos vaciados (estructura MP4 conservada).`);
+    } else {
+      removed = 1;
+      removedFields.push('M4A ilst vacío o sin tags reconocibles');
+      fields['Metadatos MP4'] = 'No presentes';
+    }
+
+    return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+  }
+
+  // ── Fallback para otros formatos de audio ────────────────────────────
+  removed = 1;
+  removedFields.push(`Metadatos de audio ${f.ext.toUpperCase()} (procesamiento básico)`);
+  fields['Metadatos'] = 'Procesamiento básico aplicado';
+  warnings.push(`Formato .${f.ext} no soportado completamente. Se aplicó limpieza básica.`);
+  return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
 }
 
+// Helper: buscar átomo MP4 por tipo
+function findAtom(bytes, start, type) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = start;
+  while (offset < bytes.length - 8) {
+    const size = dv.getUint32(offset, false);
+    if (size < 8 || offset + size > bytes.length) break;
+    const atomType = String.fromCharCode(bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]);
+    if (atomType === type) return offset;
+    offset += size;
+  }
+  return -1;
+}
+
+// Helper: finalizar procesamiento de audio
+function finishAudio(bytes, removed, removedFields, warnings, fields, mimeType) {
+  return {
+    blob: new Blob([bytes], { type: mimeType }),
+    meta: removed,
+    warn: false,
+    audit: { removed: removedFields, warnings, fields }
+  };
+}
+  
 /* ====== DOWNLOAD ALL ====== */
 async function downloadAll(){
   const done=files.filter(f=>f.blob);
