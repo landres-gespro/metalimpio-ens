@@ -2866,192 +2866,291 @@ async function stripPdf(f, opts) {
 }
 
 
-/* ── OFFICE / ODF ── */
+/* ── OFFICE / ODF (v14 — eliminación real de comentarios y revisiones) ── */
 async function stripOffice(f, opts){
-  const ab=await f.file.arrayBuffer();
-  const zip=await JSZip.loadAsync(ab);
-  let removed=0;
-  const removedFields=[];
-  const warnings=[];
+const ab=await f.file.arrayBuffer();
+const zip=await JSZip.loadAsync(ab);
+let removed=0;
+const removedFields=[];
+const warnings=[];
+const authorF   = opts.author   ? ['dc:creator','cp:lastModifiedBy','dc:description'] : [];
+const companyF  = opts.company  ? ['cp:category','cp:contentStatus'] : [];
+const statsF    = opts.stats    ? ['cp:Words','cp:Characters','cp:Pages','cp:Lines','cp:Paragraphs','cp:CharactersWithSpaces','cp:Slides','cp:Notes','cp:HiddenSlides'] : [];
+const dateF     = opts.dates    ? ['dcterms:created','dcterms:modified'] : [];
+const templateF = opts.template ? ['cp:template','cp:Template'] : [];
+const metaDocF  = (opts.author || opts.company || opts.custom) ? ['dc:title','dc:subject','cp:keywords'] : [];
+const coreFields = [...authorF, ...companyF, ...templateF, ...metaDocF];
 
-  const authorF   = opts.author   ? ['dc:creator','cp:lastModifiedBy','dc:description'] : []; // cp:lastPrinted es xsd:dateTime — se trata en el bloque de fechas
-  const companyF  = opts.company  ? ['cp:category','cp:contentStatus'] : [];
-  const statsF    = opts.stats    ? ['cp:Words','cp:Characters','cp:Pages','cp:Lines','cp:Paragraphs','cp:CharactersWithSpaces','cp:Slides','cp:Notes','cp:HiddenSlides'] : [];
-  const dateF     = opts.dates    ? ['dcterms:created','dcterms:modified'] : [];
-  const templateF = opts.template ? ['cp:template','cp:Template'] : [];
-  // dc:title, dc:subject, cp:keywords → se eliminan solo si el usuario tiene activa alguna opción de metadatos de documento
-  const metaDocF  = (opts.author || opts.company || opts.custom) ? ['dc:title','dc:subject','cp:keywords'] : [];
+function blankField(xml,fields){
+let o=xml;
+for(const field of fields){
+const localName = field.includes(':') ? field.split(':').pop() : field;
+const tagRe = new RegExp(
+`(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${localName}(?:\\s[^>]*)?>)[^<]*(</[^>]+>)`,
+'g'
+);
+o=o.replace(tagRe,(m,open)=>{
+removed++; removedFields.push(field);
+return open.slice(0,-1)+'/>';
+});
+}
+return o;
+}
 
-  // Core properties para blankField (campos CT_String — pueden quedar vacíos).
-  // Los campos de tipo xsd:dateTime (dcterms:created, dcterms:modified, lastPrinted)
-  // se excluyen aquí porque un tag self-closing vacío NO es un dateTime válido
-  // y Word lanza "contenido no legible". Se tratan por separado con fecha neutra.
-  const coreFields = [...authorF, ...companyF, ...templateF, ...metaDocF];
+const cf=zip.file('docProps/core.xml');
+const beforeFields={};
+if(cf){
+const rawCore=await cf.async('string');
+const coreTagMap={
+'dc:creator':'Autor','cp:lastModifiedBy':'Último modificador',
+'lastModifiedBy':'Último modificador',
+'dc:title':'Título','dc:subject':'Asunto','dc:description':'Descripción',
+'cp:keywords':'Palabras clave','keywords':'Palabras clave',
+'cp:lastPrinted':'Última impresión','lastPrinted':'Última impresión',
+'dcterms:created':'Fecha creación','dcterms:modified':'Fecha modificación',
+'cp:revision':'Revisión','revision':'Revisión',
+'cp:category':'Categoría','cp:contentStatus':'Estado'
+};
+for(const [tag,label] of Object.entries(coreTagMap)){
+const localName=tag.includes(':')?tag.split(':').pop():tag;
+const m=rawCore.match(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${localName}[^>]*>([^<]+)<`,'i'));
+if(m&&m[1].trim()&&!beforeFields[label])
+beforeFields[label]=m[1].trim().substring(0,120);
+}
+}
 
-  function blankField(xml,fields){
-    let o=xml;
-    for(const field of fields){
-      // FIX: regex namespace-agnostico para soportar distintos estilos de DOCX.
-      // Word desktop usa <cp:lastModifiedBy> pero Word para la web y OneDrive
-      // escriben <lastModifiedBy> (sin prefijo cp:). app.xml puede usar <Company>
-      // o <ap:Company> segun la version de Word que genero el archivo.
-      // Solucion: buscar el nombre local del campo con cualquier prefijo opcional.
-      // FIX anterior preservado: open.slice(0,-1)+'/>' mantiene atributos como
-      // xsi:type="dcterms:W3CDTF" que son obligatorios en dcterms:created/modified.
-      const localName = field.includes(':') ? field.split(':').pop() : field;
-      const tagRe = new RegExp(
-        `(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${localName}(?:\\s[^>]*)?>)[^<]*(</[^>]+>)`,
-        'g'
-      );
-      o=o.replace(tagRe,(m,open)=>{
-        removed++; removedFields.push(field);
-        return open.slice(0,-1)+'/>';
-      });
-    }
-    return o;
-  }
+if(cf){
+let x=await cf.async('string');
+x=blankField(x,coreFields);
+x=x.replace(/<(?:cp:)?revision>[^<]*<\/(?:cp:)?revision>/g,
+m => m.startsWith('<cp:') ? '<cp:revision>1</cp:revision>' : '<revision>1</revision>');
+if(opts.dates){
+const cleanTs = new Date().toISOString();
+x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?created(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
+(_,open,close)=>open+cleanTs+close);
+x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?modified(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
+(_,open,close)=>open+cleanTs+close);
+x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?lastPrinted(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
+(_,open,close)=>open+cleanTs+close);
+removed+=3; removedFields.push('dcterms:created','dcterms:modified','lastPrinted');
+}
+zip.file('docProps/core.xml',x);
+}
 
-  const cf=zip.file('docProps/core.xml');
-  // Capturar valores originales ANTES de limpiar para el informe comparativo
-  const beforeFields={};
-  if(cf){
-    const rawCore=await cf.async('string');
-    const coreTagMap={
-      'dc:creator':'Autor','cp:lastModifiedBy':'Último modificador',
-      'lastModifiedBy':'Último modificador',
-      'dc:title':'Título','dc:subject':'Asunto','dc:description':'Descripción',
-      'cp:keywords':'Palabras clave','keywords':'Palabras clave',
-      'cp:lastPrinted':'Última impresión','lastPrinted':'Última impresión',
-      'dcterms:created':'Fecha creación','dcterms:modified':'Fecha modificación',
-      'cp:revision':'Revisión','revision':'Revisión',
-      'cp:category':'Categoría','cp:contentStatus':'Estado'
-    };
-    for(const [tag,label] of Object.entries(coreTagMap)){
-      const localName=tag.includes(':')?tag.split(':').pop():tag;
-      const m=rawCore.match(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${localName}[^>]*>([^<]+)<`,'i'));
-      if(m&&m[1].trim()&&!beforeFields[label])
-        beforeFields[label]=m[1].trim().substring(0,120);
-    }
-  }
-  if(cf){
-    let x=await cf.async('string');
-    x=blankField(x,coreFields);
-    // reset revision to 1
-    // reset revision: buscar con o sin prefijo cp: (Word para la web omite el prefijo)
-    x=x.replace(/<(?:cp:)?revision>[^<]*<\/(?:cp:)?revision>/g,
-                m => m.startsWith('<cp:') ? '<cp:revision>1</cp:revision>' : '<revision>1</revision>');
-    // Campos xsd:dateTime: NO se pueden vaciar a self-closing — Word valida
-    // que el valor sea una fecha ISO 8601 válida y lanza "contenido no legible"
-    // si el elemento está vacío. Reemplazamos el valor con 1970-01-01T00:00:00Z
-    // (fecha neutra que elimina el dato real sin romper el schema OOXML).
-    // Aplica solo si opts.dates está activo.
-    if(opts.dates){
-      // Usar la fecha actual del proceso de limpieza como valor neutro.
-      // Elimina la fecha original del documento sin dejar un valor llamativo
-      // como 1970, y cumple el schema OOXML que exige un xsd:dateTime válido.
-      const cleanTs = new Date().toISOString();
-      x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?created(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
-                  (_,open,close)=>open+cleanTs+close);
-      x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?modified(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
-                  (_,open,close)=>open+cleanTs+close);
-      // lastPrinted (con o sin prefijo cp:)
-      x=x.replace(/(<(?:[a-zA-Z][a-zA-Z0-9_]*:)?lastPrinted(?:\s[^>]*)?>)[^<]*(<\/[^>]+>)/g,
-                  (_,open,close)=>open+cleanTs+close);
-      removed+=3; removedFields.push('dcterms:created','dcterms:modified','lastPrinted');
-    }
-    zip.file('docProps/core.xml',x);
-  }
+const appF2 = [];
+if (opts.company)  appF2.push('Company','Manager');
+if (opts.template) appF2.push('Application','AppVersion');
+if (opts.stats)    appF2.push('TotalTime','Pages','Words','Characters','Lines','Paragraphs','CharactersWithSpaces','Slides','Notes','HiddenSlides');
+const af=zip.file('docProps/app.xml');
+if(af){
+const rawApp=await af.async('string');
+const appTagMap={'Application':'Aplicación','AppVersion':'Versión app',
+'Company':'Empresa','Manager':'Responsable','Template':'Plantilla'};
+for(const [tag,label] of Object.entries(appTagMap)){
+const m=rawApp.match(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${tag}>([^<]+)<`,'i'));
+if(m&&m[1].trim()) beforeFields[label]=m[1].trim().substring(0,120);
+}
+}
 
-  // app.xml — Application y AppVersion solo si hay alguna opción activa (revelan contexto técnico)
-  const appF2 = [];
-  if (opts.company)  appF2.push('Company','Manager');
-  if (opts.template) appF2.push('Application','AppVersion');
-  if (opts.stats)    appF2.push('TotalTime','Pages','Words','Characters','Lines','Paragraphs','CharactersWithSpaces','Slides','Notes','HiddenSlides');
+if(af){
+let x=await af.async('string');
+x=blankField(x,appF2);
+x=x.replace(/<AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
+x=x.replace(/<(?:[a-zA-Z][a-zA-Z0-9_]*:)?AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
+const numericFields=['TotalTime','Pages','Words','Characters','Lines','Paragraphs',
+'CharactersWithSpaces','Slides','Notes','HiddenSlides','MMClips',
+'PresentationFormat'];
+for(const f of numericFields){
+x=x.replace(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${f}\\/>`, 'g'),
+`<${f}>0</${f}>`);
+}
+zip.file('docProps/app.xml',x);
+}
 
-  const af=zip.file('docProps/app.xml');
-  if(af){
-    const rawApp=await af.async('string');
-    const appTagMap={'Application':'Aplicación','AppVersion':'Versión app',
-                     'Company':'Empresa','Manager':'Responsable','Template':'Plantilla'};
-    for(const [tag,label] of Object.entries(appTagMap)){
-      const m=rawApp.match(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${tag}>([^<]+)<`,'i'));
-      if(m&&m[1].trim()) beforeFields[label]=m[1].trim().substring(0,120);
-    }
-  }
-  if(af){
-    let x=await af.async('string');
-    x=blankField(x,appF2);
-    // FIX: campos con tipo estricto en el schema OOXML que no pueden quedar vacíos.
-    // ST_AppVersion debe tener formato "XX.YYYY" — self-closing rompe Word.
-    // CT_DecimalNumber (Pages, Words, etc.) debe ser entero — self-closing rompe Word.
-    // Sustituimos los self-closing por valores neutros que no revelan información real.
-    x=x.replace(/<AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
-    x=x.replace(/<(?:[a-zA-Z][a-zA-Z0-9_]*:)?AppVersion\/>/g,'<AppVersion>0.0000</AppVersion>');
-    const numericFields=['TotalTime','Pages','Words','Characters','Lines','Paragraphs',
-                         'CharactersWithSpaces','Slides','Notes','HiddenSlides','MMClips',
-                         'PresentationFormat'];
-    for(const f of numericFields){
-      x=x.replace(new RegExp(`<(?:[a-zA-Z][a-zA-Z0-9_]*:)?${f}\\/>`, 'g'),
-                  `<${f}>0</${f}>`);
-    }
-    zip.file('docProps/app.xml',x);
-  }
+const cu=zip.file('docProps/custom.xml');
+if(cu&&opts.custom){
+zip.file('docProps/custom.xml','<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>');
+removed+=5; removedFields.push('Propiedades personalizadas (eliminadas)');
+}
 
-  // Custom properties: wipe entirely
-  const cu=zip.file('docProps/custom.xml');
-  if(cu&&opts.custom){
-    zip.file('docProps/custom.xml','<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>');
-    removed+=5; removedFields.push('Propiedades personalizadas (eliminadas)');
-  }
+// ── FASE 2: Eliminación real de comentarios y revisiones ────────────────
+// Detectar y eliminar archivos de comentarios
+const commentFiles = [
+'word/comments.xml',
+'word/commentsExtended.xml',
+'word/commentsIds.xml',
+'word/commentPeople.xml',
+'xl/comments.xml',
+'xl/comments1.xml',
+'xl/comments2.xml',
+'xl/comments3.xml',
+'ppt/comments.xml',
+'ppt/comments1.xml',
+'ppt/comments2.xml'
+];
 
-  // Detect VBA/macros - warn but don't touch
-  const hasMacros = zip.file(/xl\/vbaProject\.bin|word\/vbaProject\.bin|ppt\/vbaProject\.bin/).length > 0;
-  if(hasMacros) warnings.push('⚠ ADVERTENCIA CRÍTICA: Se han detectado macros VBA. No eliminadas automáticamente. Revisar manualmente con Inspector de Documentos de MS Office. Las macros pueden contener datos sensibles o código malicioso.');
+let commentsRemoved = false;
+for (const cf of commentFiles) {
+if (zip.file(cf) && opts.comments) {
+zip.remove(cf);
+commentsRemoved = true;
+removedFields.push(`Comentarios eliminados: ${cf}`);
+}
+}
 
-  warnings.push('Verificación: docProps/core.xml y app.xml saneados. Revisión manual recomendada con Inspector de Documentos (comentarios, revisiones, texto oculto).');
+// Función para limpiar revisiones de un archivo XML de Office
+function cleanRevisions(xml, opts) {
+if (!opts.comments) return xml;
+let cleaned = xml;
 
-  const mimes={docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-               xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-               pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-               odt:'application/vnd.oasis.opendocument.text',
-               ods:'application/vnd.oasis.opendocument.spreadsheet',
-               odp:'application/vnd.oasis.opendocument.presentation'};
-  // Reconstruir el ZIP desde cero copiando todos los archivos del original.
-  // Esto evita el bug de JSZip con "data descriptors" (bit 3 del general purpose
-  // bit flag) que afecta a DOCX generados por Microsoft Word y Word para la web,
-  // y que hace que generateAsync produzca una Central Directory con offsets
-  // incorrectos que Word rechaza al abrir.
-  //
-  // Para los archivos de docProps/* que hemos modificado, los leemos como string
-  // (ya tienen el contenido actualizado tras zip.file(...)) y los re-encodificamos
-  // a UTF-8 explícitamente para evitar problemas con el BOM (\uFEFF) que Word
-  // para la web incluye en sus archivos XML.
-  // Para el resto, copiamos los bytes originales sin tocarlos.
-  const outZip = new JSZip();
-  const modifiedFiles = new Set(['docProps/core.xml','docProps/app.xml','docProps/custom.xml']);
-  for (const name of Object.keys(zip.files)) {
-    const entry = zip.files[name];
-    if (entry.dir) continue;
-    if (modifiedFiles.has(name)) {
-      // Leer como string (ya modificado) y encodificar a UTF-8 limpio (sin BOM)
-      let content = await entry.async('string');
-      // Quitar BOM si lo hubiera — evita que Word rechace el XML
-      content = content.replace(/^﻿/, '');
-      outZip.file(name, new TextEncoder().encode(content),
-                  {compression:'DEFLATE', compressionOptions:{level:6}});
-    } else {
-      // Copiar bytes originales sin recomprimir
-      const content = await entry.async('uint8array');
-      outZip.file(name, content, {compression:'DEFLATE', compressionOptions:{level:6}});
-    }
-  }
-  const out=await outZip.generateAsync({type:'arraybuffer', compression:'DEFLATE', compressionOptions:{level:6}});
+// Eliminar contenido marcado como borrado (w:del)
+// Formato: <w:del w:author="..." w:date="..."><w:r>...</w:r></w:del>
+cleaned = cleaned.replace(/<w:del\s[^>]*>[\s\S]*?<\/w:del>/g, '');
+cleaned = cleaned.replace(/<w:del>[\s\S]*?<\/w:del>/g, '');
 
-  return{blob:new Blob([out],{type:mimes[f.ext]||'application/octet-stream'}),
-         meta:Math.max(removed,1),warn:hasMacros,
-         warnMsg:hasMacros?'Macros VBA detectadas — revisión manual obligatoria':'',
-         audit:{removed:removedFields,warnings,beforeFields,
-                fields:{'Autor/Modificador':opts.author?'Eliminado':'Omitido','Empresa':opts.company?'Eliminado':'Omitido','Fechas':opts.dates?'Sustituido por fecha de proceso':'Omitido','Propiedades personalizadas':opts.custom?'Eliminadas':'Omitido','Macros VBA':hasMacros?'⚠ Detectadas — revisión manual':'No detectadas','Copyright':'Conservado'}}};
+// Mantener contenido de inserciones (w:ins) pero eliminar el tag contenedor
+// Formato: <w:ins w:author="..." w:date="..."><w:r>...</w:r></w:ins>
+cleaned = cleaned.replace(/<w:ins\s[^>]*>([\s\S]*?)<\/w:ins>/g, '$1');
+cleaned = cleaned.replace(/<w:ins>([\s\S]*?)<\/w:ins>/g, '$1');
+
+// Eliminar tags de cambio de propiedades (metadatos de revisión)
+const changeTags = [
+'rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange',
+'tcPrChange', 'trPrChange', 'tblGridChange', 'numberingChange'
+];
+
+for (const tag of changeTags) {
+const re = new RegExp(`<w:${tag}\\s[^>]*>[\\s\\S]*?<\\/w:${tag}>`, 'g');
+cleaned = cleaned.replace(re, '');
+const re2 = new RegExp(`<w:${tag}>[\\s\\S]*?<\\/w:${tag}>`, 'g');
+cleaned = cleaned.replace(re2, '');
+}
+
+// Eliminar atributos de revisión de elementos (rsidR, rsidRPr, rsidDel, etc.)
+cleaned = cleaned.replace(/\s+w:rsid[RDP][a-zA-Z]*="[^"]*"/g, '');
+
+return cleaned;
+}
+
+// Limpiar revisiones en document.xml (Word)
+const docFiles = ['word/document.xml'];
+for (const df of docFiles) {
+const file = zip.file(df);
+if (file) {
+let xml = await file.async('string');
+const original = xml;
+xml = cleanRevisions(xml, opts);
+if (xml !== original) {
+zip.file(df, xml);
+removedFields.push(`Revisiones eliminadas: ${df}`);
+}
+}
+}
+
+// Limpiar revisiones en footnotes, endnotes, headers, footers (Word)
+const auxFiles = [
+'word/footnotes.xml', 'word/endnotes.xml',
+'word/header1.xml', 'word/header2.xml', 'word/header3.xml',
+'word/footer1.xml', 'word/footer2.xml', 'word/footer3.xml'
+];
+
+for (const af of auxFiles) {
+const file = zip.file(af);
+if (file) {
+let xml = await file.async('string');
+const original = xml;
+xml = cleanRevisions(xml, opts);
+if (xml !== original) {
+zip.file(af, xml);
+removedFields.push(`Revisiones eliminadas: ${af}`);
+}
+}
+}
+
+// Limpiar revisiones en Excel (sheets)
+const xlSheets = zip.file(/xl\/worksheets\/sheet\d+\.xml/);
+for (const sheet of xlSheets) {
+let xml = await sheet.async('string');
+const original = xml;
+// Excel usa tags diferentes: x:ins, x:del, x:cellMetadata
+xml = xml.replace(/<x:ins\s[^>]*>[\s\S]*?<\/x:ins>/g, '');
+xml = xml.replace(/<x:del\s[^>]*>[\s\S]*?<\/x:del>/g, '');
+xml = xml.replace(/<x:cellMetadata>[\s\S]*?<\/x:cellMetadata>/g, '');
+if (xml !== original) {
+zip.file(sheet.name, xml);
+removedFields.push(`Revisiones eliminadas: ${sheet.name}`);
+}
+}
+
+// Limpiar revisiones en PowerPoint (slides)
+const pptSlides = zip.file(/ppt\/slides\/slide\d+\.xml/);
+for (const slide of pptSlides) {
+let xml = await slide.async('string');
+const original = xml;
+// PowerPoint usa tags similares a Word
+xml = cleanRevisions(xml.replace(/<w:/g, '<a:').replace(/<\/w:/g, '</a:'), opts)
+.replace(/<a:/g, '<w:').replace(/<\/a:/g, '</w:');
+if (xml !== original) {
+zip.file(slide.name, xml);
+removedFields.push(`Revisiones eliminadas: ${slide.name}`);
+}
+}
+
+if (commentsRemoved || removedFields.some(f => f.includes('Revisiones eliminadas'))) {
+removed += removedFields.filter(f => f.includes('Comentarios') || f.includes('Revisiones')).length;
+}
+
+// Detect VBA/macros - warn but don't touch
+const hasMacros = zip.file(/xl\/vbaProject\.bin|word\/vbaProject\.bin|ppt\/vbaProject\.bin/).length > 0;
+if(hasMacros) warnings.push('⚠ ADVERTENCIA CRÍTICA: Se han detectado macros VBA. No eliminadas automáticamente. Revisar manualmente con Inspector de Documentos de MS Office. Las macros pueden contener datos sensibles o código malicioso.');
+
+if (opts.comments && (commentsRemoved || removedFields.some(f => f.includes('Revisiones')))) {
+warnings.push('✓ Comentarios y revisiones eliminados conforme a CCN-STIC-835.');
+} else {
+warnings.push('Verificación: docProps/core.xml y app.xml saneados. Revisión manual recomendada con Inspector de Documentos (comentarios, revisiones, texto oculto).');
+}
+
+const mimes={docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+odt:'application/vnd.oasis.opendocument.text',
+ods:'application/vnd.oasis.opendocument.spreadsheet',
+odp:'application/vnd.oasis.opendocument.presentation'};
+
+const outZip = new JSZip();
+const modifiedFiles = new Set(['docProps/core.xml','docProps/app.xml','docProps/custom.xml',
+'word/document.xml','word/footnotes.xml','word/endnotes.xml',
+'word/header1.xml','word/header2.xml','word/header3.xml',
+'word/footer1.xml','word/footer2.xml','word/footer3.xml']);
+
+// Añadir sheets de Excel y slides de PowerPoint a modifiedFiles
+for (const name of Object.keys(zip.files)) {
+if (name.match(/xl\/worksheets\/sheet\d+\.xml/) || name.match(/ppt\/slides\/slide\d+\.xml/)) {
+modifiedFiles.add(name);
+}
+}
+
+for (const name of Object.keys(zip.files)) {
+const entry = zip.files[name];
+if (entry.dir) continue;
+if (modifiedFiles.has(name)) {
+let content = await entry.async('string');
+content = content.replace(/^﻿/, '');
+outZip.file(name, new TextEncoder().encode(content),
+{compression:'DEFLATE', compressionOptions:{level:6}});
+} else {
+const content = await entry.async('uint8array');
+outZip.file(name, content, {compression:'DEFLATE', compressionOptions:{level:6}});
+}
+}
+
+const out=await outZip.generateAsync({type:'arraybuffer', compression:'DEFLATE', compressionOptions:{level:6}});
+return{blob:new Blob([out],{type:mimes[f.ext]||'application/octet-stream'}),
+meta:Math.max(removed,1),warn:hasMacros,
+warnMsg:hasMacros?'Macros VBA detectadas — revisión manual obligatoria':'',
+audit:{removed:removedFields,warnings,beforeFields,
+fields:{'Autor/Modificador':opts.author?'Eliminado':'Omitido','Empresa':opts.company?'Eliminado':'Omitido','Fechas':opts.dates?'Sustituido por fecha de proceso':'Omitido','Propiedades personalizadas':opts.custom?'Eliminadas':'Omitido','Comentarios':opts.comments&&commentsRemoved?'Eliminados':'No eliminados','Revisiones':opts.comments&&removedFields.some(f=>f.includes('Revisiones'))?'Eliminadas':'No eliminadas','Macros VBA':hasMacros?'⚠ Detectadas — revisión manual':'No detectadas','Copyright':'Conservado'}}};
 }
 
 /* ── LEGACY (DOC/XLS) ── */
