@@ -581,6 +581,7 @@ input[type="file"] { display: none; }
            { background: rgba(255,232,85,0.12);  border-color: rgba(177,138,32,0.28); color: var(--gold-dark); }
 .ext-odt, .ext-ods, .ext-odp
            { background: rgba(96,52,94,0.08);    border-color: rgba(96,52,94,0.22);   color: var(--plum-deep); }
+.ext-eml { background: rgba(96,52,94,0.08); border-color: rgba(96,52,94,0.22); color: var(--plum-deep); }
 .ext-other { background: var(--surface2); border-color: var(--border); color: var(--text-dim); }
 
 .file-info { flex: 1; min-width: 0; }
@@ -1908,6 +1909,7 @@ function getExtClass(e) {
             tiff:'ext-jpg',tif:'ext-jpg',bmp:'ext-jpg',
             mp3:'ext-mp3',wav:'ext-wav',flac:'ext-flac',ogg:'ext-mp3',aac:'ext-mp3',m4a:'ext-mp3',
             odt:'ext-odt',ods:'ext-ods',odp:'ext-odp'};
+            eml:'ext-eml'};
   return m[e]||'ext-other';
 }
 
@@ -1967,6 +1969,7 @@ const SUPPORTED_EXTS = new Set([
   'doc','xls',
   'jpg','jpeg','png','webp','gif','bmp','tiff','tif',
   'mp3','wav','flac','ogg','aac','m4a',
+  'eml',
   'txt','csv','json','xml','html','htm','md','css','js'
 ]);
 
@@ -2206,6 +2209,7 @@ const hashClean = await sha256hex(cleanBuffer);
 /* ====== FILE PROCESSORS ====== */
 async function processFile(f, opts){
   const e=f.ext;
+  if(e==='eml') return stripEml(f,opts);
   if(['jpg','jpeg','png','webp','gif','bmp','tiff','tif'].includes(e)) return stripImage(f,opts);
   if(e==='pdf') return stripPdf(f,opts);
   if(['docx','xlsx','pptx','odt','ods','odp'].includes(e)) return stripOffice(f,opts);
@@ -2926,6 +2930,129 @@ async function stripLegacy(f){
                 fields:{'Formato binario':'⚠ Revisión manual obligatoria'}}};
 }
 
+/* ── EML (CORREOS ELECTRÓNICOS) ── */
+// Usa latin1 para decodificar: mapeo 1:1 bytecarácter que preserva
+// adjuntos en base64 y codificaciones ISO-8859-1 sin corromperlos.
+async function stripEml(f, opts) {
+  const ab = await f.file.arrayBuffer();
+  const text = new TextDecoder('latin1').decode(ab);
+  
+  // Separar cabeceras y cuerpo en la primera línea en blanco
+  const sepMatch = text.match(/\r?\n\r?\n/);
+  const sepIndex = sepMatch ? sepMatch.index : -1;
+  const headerSection = sepIndex !== -1 ? text.substring(0, sepIndex) : text;
+  const bodySection = sepIndex !== -1 ? text.substring(sepIndex) : '';
+  
+  const removedFields = [];
+  const warnings = [];
+  
+  // Cabeceras explícitas a eliminar
+  const headersToRemove = [
+    'Received', 'X-Mailer', 'User-Agent', 'X-Originating-IP',
+    'X-MSMail-Priority', 'X-MimeOLE', 'X-Priority',
+    'X-MS-Has-Attach', 'X-MS-TNEF-Correlator',
+    'Thread-Index', 'Thread-Topic'
+  ];
+  
+  const lines = headerSection.split(/\r?\n/);
+  const cleanLines = [];
+  
+  // 1. Unfold cabeceras (líneas que empiezan por espacio/tab son continuación)
+  const unfolded = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0 && (lines[i].startsWith(' ') || lines[i].startsWith('\t'))) {
+      unfolded[unfolded.length - 1] += lines[i];
+    } else {
+      unfolded.push(lines[i]);
+    }
+  }
+  
+  // 2. Filtrar cabeceras
+  for (const line of unfolded) {
+    const match = line.match(/^([a-zA-Z0-9\-]+):\s*(.*)$/);
+    if (match) {
+      const name = match[1];
+      const lower = name.toLowerCase();
+      
+      let remove = false;
+      if (headersToRemove.includes(name)) remove = true;
+      else if (lower.startsWith('x-')) remove = true; // Todas las X- personalizadas
+      else if (lower === 'return-path' && opts.author) remove = true;
+      else if (lower === 'message-id') {
+        // Sustituir por genérico para no romper parsers MIME
+        cleanLines.push('Message-ID: <sanitized@local>');
+        if (!removedFields.includes('Message-ID')) removedFields.push('Message-ID (sustituido)');
+        continue;
+      }
+      
+      if (remove) {
+        if (!removedFields.includes(name)) removedFields.push(name);
+        continue;
+      }
+    }
+    cleanLines.push(line);
+  }
+  
+  // 3. Reconstruir (usando el mismo salto de línea que el original)
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const cleanHeaderSection = cleanLines.join(eol);
+  const cleanText = cleanHeaderSection + eol + bodySection;
+  
+  // 4. Codificar de vuelta a bytes (latin1 para preservar integridad binaria)
+  const outBytes = new Uint8Array(cleanText.length);
+  for (let i = 0; i < cleanText.length; i++) outBytes[i] = cleanText.charCodeAt(i);
+  
+  const blob = new Blob([outBytes], { type: 'message/rfc822' });
+  
+  if (removedFields.length === 0) {
+    warnings.push('No se detectaron cabeceras de enrutamiento o cliente para eliminar.');
+  } else {
+    warnings.push(`Cabeceras de enrutamiento y cliente eliminadas: ${removedFields.join(', ')}`);
+  }
+  
+  return {
+    blob,
+    meta: removedFields.length,
+    warn: false,
+    audit: {
+      removed: removedFields,
+      warnings,
+      fields: {
+        'Cabeceras Received': removedFields.includes('Received') ? 'Eliminadas' : 'No presentes',
+        'Identificadores de cliente': removedFields.some(h => h === 'X-Mailer' || h === 'User-Agent') ? 'Eliminados' : 'No presentes',
+        'Message-ID': removedFields.includes('Message-ID (sustituido)') ? 'Sustituido' : 'Conservado',
+        'Cabeceras X-* personalizadas': removedFields.some(h => h.toLowerCase().startsWith('x-')) ? 'Eliminadas' : 'No presentes'
+      }
+    }
+  };
+}
+
+async function scanEml(f, opts) {
+  const ab = await f.file.arrayBuffer();
+  const text = new TextDecoder('latin1').decode(ab);
+  const fields = {};
+  let count = 0;
+  
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === '' || lines[i] === '\r') break; // Fin de cabeceras
+    if (lines[i].startsWith(' ') || lines[i].startsWith('\t')) continue; // Línea plegada
+    const match = lines[i].match(/^([a-zA-Z0-9\-]+):\s*(.*)$/);
+    if (match) {
+      const name = match[1];
+      const lower = name.toLowerCase();
+      if (lower === 'received') { count++; fields['Received (Enrutamiento)'] = '⚠ Presente (revela IPs y servidores)'; }
+      else if (lower === 'x-mailer' || lower === 'user-agent') { count++; fields[name] = '⚠ Presente (revela cliente de correo)'; }
+      else if (lower === 'x-originating-ip') { count++; fields['X-Originating-IP'] = '⚠ IP del remitente'; }
+      else if (lower === 'message-id') { fields['Message-ID'] = 'Presente (puede revelar naming interno)'; count++; }
+      else if (lower.startsWith('x-')) { count++; fields[name] = '⚠ Cabecera personalizada'; }
+    }
+  }
+  
+  if (count === 0) fields['Metadatos'] = 'No se detectaron cabeceras sensibles';
+  return { fields, risk: count > 2 ? 'alto' : count > 0 ? 'medio' : 'bajo', count, note: `${count} cabecera(s) sensibles detectadas` };
+}
+  
 /* ── AUDIO (v14 — eliminación real para FLAC/WAV/OGG/M4A) ── */
 async function stripAudio(f){
   const ab = await f.file.arrayBuffer();
@@ -3716,6 +3843,7 @@ document.getElementById('inspectModal').addEventListener('click', e=>{
 async function scanFile(f, opts) {
   if (!opts) opts = getOpts();
   const e = f.ext;
+  if (e === 'eml') return scanEml(f, opts);
   if (['jpg','jpeg','png','webp','gif','bmp','tiff','tif'].includes(e)) return scanImage(f, opts);
   if (e === 'pdf') return scanPdf(f, opts);
   if (['docx','xlsx','pptx','odt','ods','odp'].includes(e)) return scanOffice(f, opts);
