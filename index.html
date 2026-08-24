@@ -2568,125 +2568,298 @@ async function stripImage(f, opts){
 }
 
 /* ── PDF ── */
-async function stripPdf(f, opts){
+async function stripPdf(f, opts) {
   const ab = await f.file.arrayBuffer();
   const raw = new Uint8Array(ab);
   const src = new TextDecoder('latin1').decode(raw);
+  const bytes = new Uint8Array(raw); // copia de trabajo
+  const removedFields = [];
+  const warnings = [];
 
-  // ── Campos a eliminar según opts ─────────────────────────────────────────
+  // ── Validación básica del header ──────────────────────────────────────
+  const headerOk =
+    bytes.length > 5 &&
+    bytes[0] === 0x25 && // %
+    bytes[1] === 0x50 && // P
+    bytes[2] === 0x44 && // D
+    bytes[3] === 0x46;   // F
+
+  if (!headerOk) {
+    return {
+      blob: new Blob([raw], { type: 'application/pdf' }),
+      meta: 0,
+      warn: true,
+      warnMsg: 'El archivo no tiene un header PDF válido (%PDF-). No se procesó.',
+      audit: {
+        removed: [],
+        warnings: ['Header PDF no válido. Archivo devuelto sin modificar.'],
+        fields: {}
+      }
+    };
+  }
+
+  // ── Campos a eliminar según opciones activas ──────────────────────────
   const toRemove = [
-    ...(opts.author  ? ['Author','Creator','Producer','LastModifiedBy'] : []),
-    ...(opts.company ? ['Company','Manager'] : []),
-    ...(opts.dates   ? ['CreationDate','ModDate'] : []),
-    ...((opts.author||opts.company||opts.custom) ? ['Title','Subject','Keywords'] : []),
+    ...(opts.author  ? ['Author', 'Creator', 'Producer', 'LastModifiedBy'] : []),
+    ...(opts.company ? ['Company', 'Manager'] : []),
+    ...(opts.dates   ? ['CreationDate', 'ModDate'] : []),
+    ...((opts.author || opts.company || opts.custom)
+      ? ['Title', 'Subject', 'Keywords'] : []),
   ];
 
-  if(toRemove.length === 0){
-    return {blob:new Blob([raw],{type:'application/pdf'}),meta:0,warn:false,
-            audit:{removed:[],warnings:['Ninguna categoría activa.'],fields:{}}};
+  if (toRemove.length === 0) {
+    return {
+      blob: new Blob([raw], { type: 'application/pdf' }),
+      meta: 0,
+      warn: false,
+      audit: {
+        removed: [],
+        warnings: ['Ninguna categoría de limpieza activa. Archivo devuelto sin modificar.'],
+        fields: {}
+      }
+    };
   }
 
-  // ── Copiar bytes para modificación in-place ───────────────────────────────
-  const bytes = new Uint8Array(raw);
-  const removedFields = [];
-
-  // Función: sobreescribir un rango de bytes con espacios
-  function blankRange(start, end){
-    for(let j = start; j < end; j++) bytes[j] = 0x20;
+  // ── Utilidad: blanquear un rango de bytes con espacios (0x20) ─────────
+  function blankRange(start, end) {
+    const s = Math.max(0, start);
+    const e = Math.min(bytes.length, end);
+    for (let j = s; j < e; j++) bytes[j] = 0x20;
   }
 
-  // ── Eliminar cada campo ───────────────────────────────────────────────────
-  // Cubre las dos variantes reales:
-  //   /Key (string literal con posibles paréntesis anidados)
-  //   /Key <hexstring>
-  // Trabajamos sobre `src` para localizar posiciones, luego blanqueamos en `bytes`.
+  // ── Utilidad: saltar whitespace en src a partir de pos ────────────────
+  function skipWS(pos) {
+    let p = pos;
+    while (p < src.length && /[\s\r\n\t\0]/.test(src[p])) p++;
+    return p;
+  }
 
-  function stripField(fieldName){
+  // ── Eliminar un campo del diccionario /Info ───────────────────────────
+  function stripField(fieldName) {
     let found = false;
     const keyTag = '/' + fieldName;
-
     let searchPos = 0;
-    while(true){
+
+    while (true) {
       const ki = src.indexOf(keyTag, searchPos);
-      if(ki === -1) break;
+      if (ki === -1) break;
 
-      // Verificar que el char siguiente (ignorando whitespace) es '(' o '<'
-      let after = ki + keyTag.length;
-      while(after < src.length && (src[after] === ' ' || src[after] === '\r' || src[after] === '\n' || src[after] === '\t')) after++;
+      // Verificar que el carácter anterior no es parte de otro token
+      if (ki > 0) {
+        const prev = src[ki - 1];
+        if (/[a-zA-Z0-9_]/.test(prev)) {
+          searchPos = ki + 1;
+          continue;
+        }
+      }
 
-      if(after >= src.length){ searchPos = ki + 1; continue; }
+      // Verificar que el carácter siguiente al key no es alfanumérico
+      const afterKey = ki + keyTag.length;
+      if (afterKey < src.length && /[a-zA-Z0-9_]/.test(src[afterKey])) {
+        searchPos = ki + 1;
+        continue;
+      }
 
-      if(src[after] === '('){
-        // String literal — respetar paréntesis anidados y escapes
-        let i = after + 1, depth = 1;
-        while(i < src.length && depth > 0){
-          if(src[i] === '\\') { i += 2; continue; }
-          if(src[i] === '(') depth++;
-          else if(src[i] === ')') { depth--; if(depth === 0) break; }
+      // Saltar whitespace entre la clave y el valor
+      const valStart = skipWS(afterKey);
+      if (valStart >= src.length) {
+        searchPos = ki + 1;
+        continue;
+      }
+
+      let valEnd = valStart;
+      const ch = src[valStart];
+
+      if (ch === '(') {
+        // ── String literal con paréntesis anidados y escapes ──
+        let depth = 1;
+        let i = valStart + 1;
+        while (i < src.length && depth > 0) {
+          if (src[i] === '\\') { i += 2; continue; }
+          if (src[i] === '(') depth++;
+          else if (src[i] === ')') { depth--; if (depth === 0) break; }
           i++;
         }
-        // Blanquear desde la clave hasta el ')' inclusive
-        blankRange(ki, i + 1);
-        found = true;
-        searchPos = i + 1;
-
-      } else if(src[after] === '<' && src[after+1] !== '<'){
-        // Hex string — buscar '>' de cierre (sin ser '<<')
-        const closeAngle = src.indexOf('>', after + 1);
-        if(closeAngle !== -1){
-          blankRange(ki, closeAngle + 1);
-          found = true;
-          searchPos = closeAngle + 1;
-        } else {
-          searchPos = ki + 1;
+        valEnd = i + 1;
+      } else if (ch === '<' && src[valStart + 1] !== '<') {
+        // ── Hex string <...> ──
+        const closeAngle = src.indexOf('>', valStart + 1);
+        if (closeAngle === -1) { searchPos = ki + 1; continue; }
+        valEnd = closeAngle + 1;
+      } else if (ch === '<' && src[valStart + 1] === '<') {
+        // ── Diccionario anidado <<...>> ──
+        let depth = 1;
+        let i = valStart + 2;
+        while (i < src.length - 1 && depth > 0) {
+          if (src[i] === '<' && src[i + 1] === '<') { depth++; i += 2; continue; }
+          if (src[i] === '>' && src[i + 1] === '>') { depth--; i += 2; continue; }
+          i++;
         }
-
+        valEnd = i;
+      } else if (ch === '/') {
+        // ── Name /Something ──
+        let i = valStart + 1;
+        while (i < src.length && !/[\s\r\n\t<>\/\[\](){}%]/.test(src[i])) i++;
+        valEnd = i;
+      } else if (ch === '[') {
+        // ── Array [...] ──
+        let depth = 1;
+        let i = valStart + 1;
+        while (i < src.length && depth > 0) {
+          if (src[i] === '[') depth++;
+          else if (src[i] === ']') { depth--; if (depth === 0) break; }
+          i++;
+        }
+        valEnd = i + 1;
+      } else if (/[\d.+\-]/.test(ch)) {
+        // ── Número o referencia indirecta (123 0 R) ──
+        let i = valStart;
+        let tokens = 0;
+        while (i < src.length && tokens < 3) {
+          while (i < src.length && /[\s\r\n\t]/.test(src[i])) i++;
+          if (i >= src.length) break;
+          const tokStart = i;
+          while (i < src.length && !/[\s\r\n\t<>\/\[\](){}%]/.test(src[i])) i++;
+          if (i === tokStart) break;
+          tokens++;
+          if (src.slice(tokStart, i) === 'R') break;
+        }
+        valEnd = i;
       } else {
-        // No es un valor reconocible en este contexto — saltar
         searchPos = ki + 1;
+        continue;
       }
+
+      blankRange(ki, valEnd);
+      found = true;
+      searchPos = valEnd;
     }
 
-    if(found) removedFields.push('/' + fieldName);
+    if (found) removedFields.push('/' + fieldName);
     return found;
   }
 
-  for(const field of toRemove) stripField(field);
+  // ── Ejecutar la eliminación de cada campo ─────────────────────────────
+  for (const field of toRemove) {
+    stripField(field);
+  }
 
-  // ── Limpiar XMP stream ────────────────────────────────────────────────────
-  const xs = src.indexOf('<?xpacket begin');
-  const xe = src.lastIndexOf('<?xpacket end');
-  if(xs !== -1 && xe !== -1){
-    const xEnd = src.indexOf('?>', xe);
-    if(xEnd !== -1){
-      const minXmp = '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>';
-      const writeLen = Math.min(minXmp.length, xEnd + 2 - xs);
-      for(let j = xs; j < xEnd + 2; j++) bytes[j] = 0x20;
-      for(let j = 0; j < writeLen; j++) bytes[xs + j] = minXmp.charCodeAt(j) & 0xff;
-      removedFields.push('/XMP stream');
+  // ── Limpiar XMP stream ────────────────────────────────────────────────
+  const xmpPatterns = [
+    { startTag: '<?xpacket begin', endTag: '<?xpacket end',  endSuffix: '?>' },
+    { startTag: '<x:xmpmeta',      endTag: '</x:xmpmeta>',   endSuffix: ''   },
+    { startTag: '<xmpmeta',        endTag: '</xmpmeta>',     endSuffix: ''   },
+  ];
+
+  let xmpCleaned = false;
+  for (const pat of xmpPatterns) {
+    const xs = src.indexOf(pat.startTag);
+    if (xs === -1) continue;
+    const xe = src.lastIndexOf(pat.endTag);
+    if (xe === -1 || xe <= xs) continue;
+
+    let endPos = xe + pat.endTag.length;
+    if (pat.endSuffix) {
+      const suffixPos = src.indexOf(pat.endSuffix, xe);
+      if (suffixPos !== -1) endPos = suffixPos + pat.endSuffix.length;
+    }
+
+    const minXmp =
+      '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>' +
+      '<x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>' +
+      '<?xpacket end="w"?>';
+
+    const spanLen = endPos - xs;
+    blankRange(xs, endPos);
+    const writeLen = Math.min(minXmp.length, spanLen);
+    for (let j = 0; j < writeLen; j++) {
+      bytes[xs + j] = minXmp.charCodeAt(j) & 0xff;
+    }
+
+    xmpCleaned = true;
+    removedFields.push('/Metadata XMP stream');
+    break;
+  }
+
+  // ── Limpiar referencia /Metadata en el catálogo ───────────────────────
+  const catMetaRe = /\/Metadata\s+\d+\s+\d+\s+R/g;
+  let catMatch;
+  while ((catMatch = catMetaRe.exec(src)) !== null) {
+    blankRange(catMatch.index, catMatch.index + catMatch[0].length);
+    if (!removedFields.includes('/Metadata ref (catalog)')) {
+      removedFields.push('/Metadata ref (catalog)');
     }
   }
 
+  // ── Detección de object streams (PDF 1.5+) ────────────────────────────
+  const hasObjStm = src.includes('/ObjStm');
+  const hasXRefStm = src.includes('/XRef');
+
+  // ── Construir warnings ────────────────────────────────────────────────
+  if (removedFields.length > 0) {
+    warnings.push(
+      'Campos eliminados del PDF: ' + removedFields.join(', ')
+    );
+  } else {
+    warnings.push(
+      'No se detectaron metadatos en texto plano. ' +
+      'Si el PDF usa object streams comprimidos (PDF 1.5+) o está cifrado, ' +
+      'use exiftool para una limpieza completa.'
+    );
+  }
+
+  if (hasObjStm) {
+    warnings.push(
+      '⚠ Se detectaron object streams (/ObjStm). ' +
+      'Los metadatos dentro de streams comprimidos pueden no haberse eliminado. ' +
+      'Verifique con exiftool -all= archivo.pdf'
+    );
+  }
+
+  if (hasXRefStm) {
+    warnings.push(
+      'ℹ PDF con cross-reference stream (PDF 1.5+). Estructura moderna detectada.'
+    );
+  }
+
+  warnings.push(
+    'ADVERTENCIA: Macros JS, adjuntos embebidos y capas OCG ' +
+    'requieren revisión manual con Adobe Acrobat.'
+  );
+
+  // ── Resultado ─────────────────────────────────────────────────────────
   const removed = removedFields.length;
-  const warnings = removed > 0
-    ? [`Campos eliminados del PDF: ${removedFields.join(', ')}`]
-    : ['No se detectaron metadatos en texto plano. Si el PDF usa object streams comprimidos (PDF 1.5+), use exiftool para limpieza completa.'];
-  warnings.push('ADVERTENCIA: Macros JS y adjuntos embebidos requieren revisión manual con Adobe Acrobat.');
 
   return {
-    blob: new Blob([bytes], {type:'application/pdf'}),
+    blob: new Blob([bytes], { type: 'application/pdf' }),
     meta: Math.max(removed, 1),
     warn: false,
     audit: {
       removed: removedFields,
       warnings,
       fields: {
-        'Autor/Creador':  opts.author  ? (removedFields.some(x=>x.includes('Author')||x.includes('Creator')) ? 'Eliminado' : 'No detectado') : 'Omitido',
-        'Empresa':        opts.company ? (removedFields.some(x=>x.includes('Company')) ? 'Eliminado' : 'No detectado') : 'Omitido',
-        'Fechas':         opts.dates   ? (removedFields.some(x=>x.includes('Date')) ? 'Eliminado' : 'No detectado') : 'Omitido',
-        'Título/Asunto':  (opts.author||opts.company||opts.custom) ? (removedFields.some(x=>x.includes('Title')||x.includes('Subject')) ? 'Eliminado' : 'No detectado') : 'Omitido',
-        'XMP stream':     removedFields.includes('/XMP stream') ? 'Vaciado in-place' : 'No detectado',
-        'Copyright':      'Conservado',
+        'Autor/Creador': opts.author
+          ? (removedFields.some(x =>
+              x.includes('Author') || x.includes('Creator') || x.includes('Producer'))
+              ? 'Eliminado' : 'No detectado')
+          : 'Omitido',
+        'Empresa': opts.company
+          ? (removedFields.some(x => x.includes('Company') || x.includes('Manager'))
+              ? 'Eliminado' : 'No detectado')
+          : 'Omitido',
+        'Fechas': opts.dates
+          ? (removedFields.some(x =>
+              x.includes('CreationDate') || x.includes('ModDate'))
+              ? 'Eliminado' : 'No detectado')
+          : 'Omitido',
+        'Título/Asunto/Palabras clave': (opts.author || opts.company || opts.custom)
+          ? (removedFields.some(x =>
+              x.includes('Title') || x.includes('Subject') || x.includes('Keywords'))
+              ? 'Eliminado' : 'No detectado')
+          : 'Omitido',
+        'XMP stream': xmpCleaned ? 'Vaciado in-place' : 'No detectado',
+        'Object streams': hasObjStm ? '⚠ Detectados (verificar con exiftool)' : 'No detectados',
+        'Copyright': 'Conservado',
       }
     }
   };
