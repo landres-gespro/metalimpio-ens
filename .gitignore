@@ -1,0 +1,24 @@
+# Archivos temporales del navegador
+*.log
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (si se añaden tests en el futuro)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Builds
+dist/
+build/
+
+# Archivos de prueba con datos sensibles
+tests/fixtures/private/
+*.sensitive
