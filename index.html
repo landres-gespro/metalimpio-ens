@@ -3452,57 +3452,78 @@ function buildPdfBytes(objects, infoDictStr) {
 }
 
 function generateAuditPdf(records, auditLog, globalHash) {
-    const now = new Date().toLocaleString('es-ES');
-    const totalMeta = records.reduce((s,r)=>s+(r.meta||0),0);
-    
-    // Construir flujo de contenido (Texto y líneas)
-    let stream = 'BT /F1 14 Tf 50 760 Td (INFORME DE AUDITORIA - MetaLimpio ENS) Tj ET\n';
-    stream += 'BT /F1 9 Tf 50 740 Td (CCN-STIC-835 | Medida [mp.info.5] | [org.3]) Tj ET\n';
-    stream += 'BT /F1 8 Tf 50 725 Td (Generado: ' + escapePdfStr(now) + ') Tj ET\n';
-    stream += '50 715 m 550 715 l S\n'; // Línea separadora
-    
-    let y = 700;
-    stream += 'BT /F1 10 Tf 50 ' + y + ' Td (RESUMEN DEL PROCESO) Tj ET\n'; y -= 15;
-    stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Archivos procesados: ' + records.length + ') Tj ET\n'; y -= 12;
-    stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Campos eliminados: ' + totalMeta + ') Tj ET\n'; y -= 12;
-    stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Procesamiento: 100% Local - Sin exfiltracion de datos) Tj ET\n'; y -= 20;
-    
-    stream += 'BT /F1 10 Tf 50 ' + y + ' Td (DETALLE DE ARCHIVOS) Tj ET\n'; y -= 15;
-    stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Nombre) Tj ET\n';
-    stream += 'BT /F1 7 Tf 200 ' + y + ' Td (Estado) Tj ET\n';
-    stream += 'BT /F1 7 Tf 260 ' + y + ' Td (SHA-256 Original) Tj ET\n'; y -= 10;
-    stream += '50 ' + y + ' m 550 ' + y + ' l S\n'; y -= 12;
-    
-    for (const r of records) {
-        if (y < 100) { /* Salto de página simplificado: truncamos para mantener el motor mínimo */ break; }
-        const name = escapePdfStr(r.name.substring(0, 35));
-        const status = r.status === 'done' ? 'OK' : r.status === 'warn' ? 'WARN' : 'ERR';
-        const hash = escapePdfStr((r.audit.hashOrig || '').substring(0, 16) + '...');
-        stream += 'BT /F1 7 Tf 50 ' + y + ' Td (' + name + ') Tj ET\n';
-        stream += 'BT /F1 7 Tf 200 ' + y + ' Td (' + status + ') Tj ET\n';
-        stream += 'BT /F1 6 Tf 260 ' + y + ' Td (' + hash + ') Tj ET\n';
-        y -= 12;
+  const now = new Date().toLocaleString('es-ES');
+  const totalMeta = records.reduce((s,r)=>s+(r.meta||0),0);
+  
+  // Construir flujo de contenido (Texto y líneas)
+  let stream = 'BT /F1 14 Tf 50 760 Td (INFORME DE AUDITORIA - MetaLimpio ENS) Tj ET\n';
+  stream += 'BT /F1 9 Tf 50 740 Td (CCN-STIC-835 | Medida [mp.info.5]) Tj ET\n';
+  stream += 'BT /F1 8 Tf 50 725 Td (Generado: ' + escapePdfStr(now) + ') Tj ET\n';
+  stream += '50 715 m 550 715 l S\n'; // Línea separadora
+  
+  let y = 700;
+  stream += 'BT /F1 10 Tf 50 ' + y + ' Td (RESUMEN DEL PROCESO) Tj ET\n'; y -= 15;
+  stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Archivos procesados: ' + records.length + ') Tj ET\n'; y -= 12;
+  stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Campos eliminados: ' + totalMeta + ') Tj ET\n'; y -= 12;
+  stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Procesamiento: 100% Local - Sin exfiltracion de datos) Tj ET\n'; y -= 20;
+  
+  // DETALLE POR ARCHIVO CON CAMPOS ELIMINADOS
+  stream += 'BT /F1 10 Tf 50 ' + y + ' Td (DETALLE DE ARCHIVOS Y CAMPOS ELIMINADOS) Tj ET\n'; y -= 15;
+  
+  for (const r of records) {
+    if (y < 150) { 
+      // Salto de página simplificado
+      stream += 'BT /F1 8 Tf 50 50 Td (Continuacion en pagina siguiente...) Tj ET\n';
+      y = 750; 
     }
     
-    y -= 10;
-    stream += '50 ' + y + ' m 550 ' + y + ' l S\n'; y -= 15;
-    stream += 'BT /F1 10 Tf 50 ' + y + ' Td (SELLO DE INTEGRIDAD [org.3]) Tj ET\n'; y -= 15;
-    stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Hash SHA-256 de sesion: ' + escapePdfStr(globalHash) + ') Tj ET\n'; y -= 12;
-    stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Este hash garantiza la trazabilidad del proceso de limpieza.) Tj ET\n';
+    const name = escapePdfStr(r.name.substring(0, 40));
+    const status = r.status === 'done' ? 'OK' : r.status === 'warn' ? 'WARN' : 'ERR';
+    const hash = escapePdfStr((r.audit.hashOrig || '').substring(0, 16) + '...');
+    
+    // Nombre del archivo y estado
+    stream += 'BT /F1 9 Tf 50 ' + y + ' Td (' + name + ') Tj ET\n'; y -= 12;
+    stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Estado: ' + status + ') Tj ET\n';
+    stream += 'BT /F1 6 Tf 200 ' + y + ' Td (SHA-256: ' + hash + ') Tj ET\n'; y -= 12;
+    
+    // Campos eliminados
+    if (r.audit && r.audit.removed && r.audit.removed.length > 0) {
+      stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Campos eliminados:) Tj ET\n'; y -= 10;
+      for (const field of r.audit.removed) {
+        if (y < 160) break;
+        const fieldName = escapePdfStr('  - ' + field.substring(0, 55));
+        stream += 'BT /F1 6 Tf 55 ' + y + ' Td (' + fieldName + ') Tj ET\n'; y -= 9;
+      }
+    }
+    
+    // Advertencias si las hay
+    if (r.audit && r.audit.warnings && r.audit.warnings.length > 0) {
+      y -= 5;
+      stream += 'BT /F1 6 Tf 55 ' + y + ' Td (Advertencias: ' + escapePdfStr(r.audit.warnings[0].substring(0, 60)) + ') Tj ET\n'; y -= 10;
+    }
+    
+    y -= 8;
+    stream += '50 ' + y + ' m 550 ' + y + ' l S\n'; y -= 10; // Línea separadora entre archivos
+  }
+  
+  y -= 10;
+  stream += 'BT /F1 10 Tf 50 ' + y + ' Td (SELLO DE INTEGRIDAD) Tj ET\n'; y -= 15;
+  stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Hash SHA-256 de sesion: ' + escapePdfStr(globalHash) + ') Tj ET\n'; y -= 12;
+  stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Este hash garantiza la trazabilidad del proceso de limpieza.) Tj ET\n';
 
-    // Objetos PDF
-    const objs = [];
-    objs.push('<< /Type /Catalog /Pages 2 0 R >>'); // 1: Catalog
-    objs.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'); // 2: Pages
-    objs.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>'); // 3: Page
-    objs.push('<< /Length ' + stream.length + ' >>\nstream\n' + stream + 'endstream'); // 4: Content
-    objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>'); // 5: Font
-    
-    // 6: Info Dict (con sello de integridad embebido)
-    const infoStr = '<< /Title (Informe Auditoria MetaLimpio ENS) /Author (MetaLimpio v14) /CreationDate (D:' + new Date().toISOString().replace(/[-:T]/g,'').substring(0,14) + ') /IntegrityHash (' + escapePdfStr(globalHash) + ') >>';
-    objs.push(infoStr);
-    
-    return buildPdfBytes(objs, infoStr);
+  // Objetos PDF
+  const objs = [];
+  objs.push('<< /Type /Catalog /Pages 2 0 R >>'); // 1: Catalog
+  objs.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'); // 2: Pages
+  objs.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>'); // 3: Page
+  objs.push('<< /Length ' + stream.length + ' >>\nstream\n' + stream + 'endstream'); // 4: Content
+  objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>'); // 5: Font
+  
+  // 6: Info Dict (con sello de integridad embebido)
+  const infoStr = '<< /Title (Informe Auditoria MetaLimpio ENS) /Author (MetaLimpio v14) /CreationDate (D:' + new Date().toISOString().replace(/[-:T]/g,'').substring(0,14) + ') /IntegrityHash (' + escapePdfStr(globalHash) + ') >>';
+  objs.push(infoStr);
+  
+  return buildPdfBytes(objs, infoStr);
 }
   
 function downloadAuditReport(){
