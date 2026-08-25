@@ -1715,8 +1715,7 @@ async function scanOffice(f, opts) {
 if (!opts) opts = getOpts();
 const ab = await f.file.arrayBuffer();
 let zip;
-try { zip = await JSZip.loadAsync(ab); } catch(ex) { return {fields:{'Error':'No se pudo descomprimir el archivo Office'},risk:'alto',count:0,note:'Error al leer el ZIP — archivo posiblemente cifrado o corrupto'}; }
-const fields = {};
+try { zip = await JSZip.loadAsync(ab); } catch(ex) { return {fields:{'Error':'No se pudo descomprimir el archivo Office'},risk:'alto',count:0,note:'Error al leer el ZIP'}; }const fields = {};
 let count = 0;
 const coreFile = zip.file('docProps/core.xml');
 if (coreFile) {
@@ -2938,6 +2937,10 @@ const riskColor = scan.risk==='alto'?'var(--red)':scan.risk==='medio'?'var(--amb
 const riskLabel = scan.risk==='alto'?'ALTO':scan.risk==='medio'?'MEDIO':'BAJO';
 const afterFields = {};
 for (const [k, v] of Object.entries(scan.fields)) {
+if (k === 'Error') {
+afterFields[k] = ' No analizable — revisar manualmente';
+continue;
+}
 if (k === 'Copyright' || k === 'Portada/Carátula') {
 afterFields[k] = 'Conservado';
 } else if (k === 'Macros VBA') {
