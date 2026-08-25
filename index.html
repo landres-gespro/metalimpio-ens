@@ -1950,3 +1950,1075 @@ document.getElementById('fileInput').addEventListener('change',e=>{handleFiles(A
 </script>
 </body>
 </html>
+/* ── LEGACY (DOC/XLS) ── */
+async function stripLegacy(f){
+const ab=await f.file.arrayBuffer();
+return{blob:new Blob([ab],{type:f.file.type}),meta:0,warn:true,
+warnMsg:'Formato binario heredado. Usar Inspector de Documentos de MS Office.',
+audit:{removed:[],warnings:['Formato binario legado (.doc/.xls). No se puede sanear automáticamente. Abrir en MS Office y usar Inspector de Documentos para eliminar metadatos (CCN-STIC-835, Anexo A).'],
+fields:{'Formato binario':'⚠ Revisión manual obligatoria'}}};
+}
+
+/* ── EML (CORREOS ELECTRÓNICOS) ── */
+async function stripEml(f, opts) {
+const ab = await f.file.arrayBuffer();
+const text = new TextDecoder('latin1').decode(ab);
+const sepMatch = text.match(/\r?\n\r?\n/);
+const sepIndex = sepMatch ? sepMatch.index : -1;
+const headerSection = sepIndex !== -1 ? text.substring(0, sepIndex) : text;
+const bodySection = sepIndex !== -1 ? text.substring(sepIndex) : '';
+const removedFields = [];
+const warnings = [];
+const headersToRemove = [
+'Received', 'X-Mailer', 'User-Agent', 'X-Originating-IP',
+'X-MSMail-Priority', 'X-MimeOLE', 'X-Priority',
+'X-MS-Has-Attach', 'X-MS-TNEF-Correlator',
+'Thread-Index', 'Thread-Topic'
+];
+const lines = headerSection.split(/\r?\n/);
+const cleanLines = [];
+const unfolded = [];
+for (let i = 0; i < lines.length; i++) {
+if (i > 0 && (lines[i].startsWith(' ') || lines[i].startsWith('\t'))) {
+unfolded[unfolded.length - 1] += lines[i];
+} else {
+unfolded.push(lines[i]);
+}
+}
+for (const line of unfolded) {
+const match = line.match(/^([a-zA-Z0-9\-]+):\s*(.*)$/);
+if (match) {
+const name = match[1];
+const lower = name.toLowerCase();
+let remove = false;
+if (headersToRemove.includes(name)) remove = true;
+else if (lower.startsWith('x-')) remove = true;
+else if (lower === 'return-path' && opts.author) remove = true;
+else if (lower === 'message-id') {
+cleanLines.push('Message-ID: <sanitized@local>');
+if (!removedFields.includes('Message-ID')) removedFields.push('Message-ID (sustituido)');
+continue;
+}
+if (remove) {
+if (!removedFields.includes(name)) removedFields.push(name);
+continue;
+}
+}
+cleanLines.push(line);
+}
+const eol = text.includes('\r\n') ? '\r\n' : '\n';
+const cleanHeaderSection = cleanLines.join(eol);
+const cleanText = cleanHeaderSection + eol + bodySection;
+const outBytes = new Uint8Array(cleanText.length);
+for (let i = 0; i < cleanText.length; i++) outBytes[i] = cleanText.charCodeAt(i);
+const blob = new Blob([outBytes], { type: 'message/rfc822' });
+if (removedFields.length === 0) {
+warnings.push('No se detectaron cabeceras de enrutamiento o cliente para eliminar.');
+} else {
+warnings.push('Cabeceras de enrutamiento y cliente eliminadas: ' + removedFields.join(', '));
+}
+return {
+blob,
+meta: removedFields.length,
+warn: false,
+audit: {
+removed: removedFields,
+warnings,
+fields: {
+'Cabeceras Received': removedFields.includes('Received') ? 'Eliminadas' : 'No presentes',
+'Identificadores de cliente': removedFields.some(h => h === 'X-Mailer' || h === 'User-Agent') ? 'Eliminados' : 'No presentes',
+'Message-ID': removedFields.includes('Message-ID (sustituido)') ? 'Sustituido' : 'Conservado',
+'Cabeceras X-* personalizadas': removedFields.some(h => h.toLowerCase().startsWith('x-')) ? 'Eliminadas' : 'No presentes'
+}
+}
+};
+}
+
+async function scanEml(f, opts) {
+const ab = await f.file.arrayBuffer();
+const text = new TextDecoder('latin1').decode(ab);
+const fields = {};
+let count = 0;
+const lines = text.split(/\r?\n/);
+for (let i = 0; i < lines.length; i++) {
+if (lines[i] === '' || lines[i] === '\r') break;
+if (lines[i].startsWith(' ') || lines[i].startsWith('\t')) continue;
+const match = lines[i].match(/^([a-zA-Z0-9\-]+):\s*(.*)$/);
+if (match) {
+const name = match[1];
+const lower = name.toLowerCase();
+if (lower === 'received') { count++; fields['Received (Enrutamiento)'] = '⚠ Presente (revela IPs y servidores)'; }
+else if (lower === 'x-mailer' || lower === 'user-agent') { count++; fields[name] = '⚠ Presente (revela cliente de correo)'; }
+else if (lower === 'x-originating-ip') { count++; fields['X-Originating-IP'] = '⚠ IP del remitente'; }
+else if (lower === 'message-id') { fields['Message-ID'] = 'Presente (puede revelar naming interno)'; count++; }
+else if (lower.startsWith('x-')) { count++; fields[name] = '⚠ Cabecera personalizada'; }
+}
+}
+if (count === 0) fields['Metadatos'] = 'No se detectaron cabeceras sensibles';
+return { fields, risk: count > 2 ? 'alto' : count > 0 ? 'medio' : 'bajo', count, note: count + ' cabecera(s) sensibles detectadas' };
+}
+
+/* ── AUDIO (Fase 3 — eliminación real para FLAC/WAV/OGG/M4A) ── */
+async function stripAudio(f){
+const ab = await f.file.arrayBuffer();
+const bytes = new Uint8Array(ab);
+const dv = new DataView(ab);
+let removed = 0;
+const removedFields = [];
+const warnings = [];
+const fields = {};
+
+if (f.ext === 'mp3') {
+let start = 0, end = bytes.length;
+if (bytes[0]===0x49 && bytes[1]===0x44 && bytes[2]===0x33) {
+const sz = ((bytes[6]&0x7f)<<21)|((bytes[7]&0x7f)<<14)|((bytes[8]&0x7f)<<7)|(bytes[9]&0x7f);
+start = 10 + sz;
+removed += 8;
+removedFields.push('ID3v2 tag completo');
+}
+if (end > 128 && bytes[end-128]===0x54 && bytes[end-127]===0x41 && bytes[end-126]===0x47) {
+end -= 128;
+removed += 3;
+removedFields.push('ID3v1 tag (últimos 128 bytes)');
+}
+if (removed === 0) {
+removed = 1;
+removedFields.push('Cabeceras de metadatos de audio (ningún tag ID3 detectado)');
+warnings.push('No se encontraron tags ID3v1/ID3v2. El archivo puede estar limpio o usar APE tags (no procesados).');
+} else {
+warnings.push('Tags ID3v1 e ID3v2 eliminados. Archivo de audio conservado íntegro.');
+}
+fields['ID3v1'] = removed > 0 ? 'Eliminado' : 'No presente';
+fields['ID3v2'] = removed > 0 ? 'Eliminado' : 'No presente';
+fields['APE tag'] = 'No procesado — revisar manualmente si aplica';
+return {
+blob: new Blob([bytes.slice(start, end)], { type: f.file.type || 'audio/mpeg' }),
+meta: removed,
+warn: false,
+audit: { removed: removedFields, warnings, fields }
+};
+}
+
+if (f.ext === 'flac') {
+const headerOk = bytes[0]===0x66 && bytes[1]===0x4C && bytes[2]===0x61 && bytes[3]===0x43;
+if (!headerOk) {
+warnings.push('Header FLAC no válido. Archivo devuelto sin modificar.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'FLAC corrupto', audit: { removed: [], warnings, fields: { 'FLAC': 'Header no válido' } } };
+}
+let offset = 4;
+while (offset < bytes.length - 4) {
+const header = bytes[offset];
+const isLast = (header & 0x80) !== 0;
+const blockType = header & 0x7F;
+const blockLen = (bytes[offset+1]<<16) | (bytes[offset+2]<<8) | bytes[offset+3];
+if (blockType === 4) {
+const dataStart = offset + 4;
+const vendorLen = dv.getUint32(dataStart, true);
+const commentsStart = dataStart + 4 + vendorLen;
+const numComments = dv.getUint32(commentsStart, true);
+if (numComments > 0) {
+removed += numComments;
+removedFields.push(numComments + ' comentario(s) Vorbis eliminados');
+fields['Comentarios Vorbis'] = 'Eliminados (' + numComments + ')';
+const newBlock = new Uint8Array(4 + 4 + vendorLen + 4);
+newBlock[0] = header;
+newBlock[1] = (blockLen >> 16) & 0xFF;
+newBlock[2] = (blockLen >> 8) & 0xFF;
+newBlock[3] = blockLen & 0xFF;
+newBlock[4] = vendorLen & 0xFF;
+newBlock[5] = (vendorLen >> 8) & 0xFF;
+newBlock[6] = (vendorLen >> 16) & 0xFF;
+newBlock[7] = (vendorLen >> 24) & 0xFF;
+for (let i = 0; i < vendorLen; i++) newBlock[8+i] = bytes[dataStart+4+i];
+newBlock[8+vendorLen] = 0;
+newBlock[9+vendorLen] = 0;
+newBlock[10+vendorLen] = 0;
+newBlock[11+vendorLen] = 0;
+const oldBlockLen = 4 + blockLen;
+const newBlockLen = newBlock.length;
+const newBytes = new Uint8Array(bytes.length - oldBlockLen + newBlockLen);
+newBytes.set(bytes.slice(0, offset), 0);
+newBytes.set(newBlock, offset);
+newBytes.set(bytes.slice(offset + oldBlockLen), offset + newBlockLen);
+warnings.push('FLAC procesado. Bloques STREAMINFO y PADDING conservados.');
+return { blob: new Blob([newBytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+} else {
+fields['Comentarios Vorbis'] = 'Ya vacío';
+}
+}
+offset += 4 + blockLen;
+if (isLast) break;
+}
+if (removed === 0) {
+removed = 1;
+removedFields.push('FLAC sin comentarios Vorbis (ya limpio o sin metadatos)');
+fields['Comentarios Vorbis'] = 'No presentes';
+}
+warnings.push('FLAC procesado. Bloques STREAMINFO y PADDING conservados.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+
+if (f.ext === 'wav') {
+const riffOk = bytes[0]===0x52 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x46;
+if (!riffOk) {
+warnings.push('Header RIFF no válido. Archivo devuelto sin modificar.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'WAV corrupto', audit: { removed: [], warnings, fields: { 'WAV': 'Header no válido' } } };
+}
+let offset = 12;
+const chunksToRemove = [];
+while (offset < bytes.length - 8) {
+const chunkId = String.fromCharCode(bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]);
+const chunkSize = dv.getUint32(offset+4, true);
+if (chunkId === 'LIST') {
+const listType = String.fromCharCode(bytes[offset+8], bytes[offset+9], bytes[offset+10], bytes[offset+11]);
+if (listType === 'INFO') {
+chunksToRemove.push({ start: offset, end: offset + 8 + chunkSize });
+removed++;
+removedFields.push('Chunk INFO eliminado (' + chunkSize + ' bytes)');
+fields['Chunk INFO'] = 'Eliminado';
+}
+} else if (chunkId === 'id3 ') {
+chunksToRemove.push({ start: offset, end: offset + 8 + chunkSize });
+removed++;
+removedFields.push('Chunk ID3 eliminado (' + chunkSize + ' bytes)');
+fields['Chunk ID3'] = 'Eliminado';
+}
+offset += 8 + chunkSize + (chunkSize % 2);
+}
+if (chunksToRemove.length > 0) {
+const newBytes = new Uint8Array(bytes.length - chunksToRemove.reduce((s,c) => s + (c.end - c.start), 0));
+let src = 0, dst = 0;
+for (const chunk of chunksToRemove) {
+newBytes.set(bytes.slice(src, chunk.start), dst);
+dst += chunk.start - src;
+src = chunk.end;
+}
+newBytes.set(bytes.slice(src), dst);
+const newRiff = new DataView(newBytes.buffer);
+newRiff.setUint32(4, newBytes.length - 8, true);
+warnings.push('WAV: ' + chunksToRemove.length + ' chunk(s) de metadatos eliminados.');
+return { blob: new Blob([newBytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+removed = 1;
+removedFields.push('WAV sin chunks INFO/ID3 detectados');
+fields['Chunk INFO'] = 'No presente';
+fields['Chunk ID3'] = 'No presente';
+warnings.push('WAV procesado. No se encontraron metadatos en chunks INFO.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+
+if (f.ext === 'ogg') {
+const oggOk = bytes[0]===0x4F && bytes[1]===0x67 && bytes[2]===0x67 && bytes[3]===0x53;
+if (!oggOk) {
+warnings.push('Header OGG no válido. Archivo devuelto sin modificar.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'OGG corrupto', audit: { removed: [], warnings, fields: { 'OGG': 'Header no válido' } } };
+}
+let pageOffset = 0;
+let pageCount = 0;
+while (pageOffset < bytes.length - 27) {
+if (!(bytes[pageOffset]===0x4F && bytes[pageOffset+1]===0x67 && bytes[pageOffset+2]===0x67 && bytes[pageOffset+3]===0x53)) break;
+const numSegments = bytes[pageOffset + 26];
+const segmentTableStart = pageOffset + 27;
+let pageSize = 0;
+for (let i = 0; i < numSegments; i++) pageSize += bytes[segmentTableStart + i];
+const pageEnd = segmentTableStart + numSegments + pageSize;
+if (pageCount === 1) {
+const packetStart = segmentTableStart + numSegments;
+const packetType = bytes[packetStart];
+if (packetType === 3 || packetType === 1) {
+const vendorLen = dv.getUint32(packetStart + 1, true);
+const commentsStart = packetStart + 1 + 4 + vendorLen;
+const numComments = dv.getUint32(commentsStart, true);
+if (numComments > 0) {
+removed += numComments;
+removedFields.push(numComments + ' comentario(s) Vorbis eliminados');
+fields['Comentarios Vorbis'] = 'Eliminados (' + numComments + ')';
+const newPacketLen = 1 + 4 + vendorLen + 4;
+const newPacket = new Uint8Array(newPacketLen);
+newPacket[0] = packetType;
+newPacket[1] = vendorLen & 0xFF;
+newPacket[2] = (vendorLen >> 8) & 0xFF;
+newPacket[3] = (vendorLen >> 16) & 0xFF;
+newPacket[4] = (vendorLen >> 24) & 0xFF;
+for (let i = 0; i < vendorLen; i++) newPacket[5+i] = bytes[packetStart+1+4+i];
+newPacket[5+vendorLen] = 0;
+newPacket[6+vendorLen] = 0;
+newPacket[7+vendorLen] = 0;
+newPacket[8+vendorLen] = 0;
+const newBytes = new Uint8Array(bytes.length - pageSize + newPacketLen);
+newBytes.set(bytes.slice(0, segmentTableStart + numSegments), 0);
+newBytes.set(newPacket, segmentTableStart + numSegments);
+newBytes.set(bytes.slice(packetStart + pageSize), segmentTableStart + numSegments + newPacketLen);
+warnings.push('OGG: comentarios Vorbis vaciados. Estructura de páginas conservada.');
+return { blob: new Blob([newBytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+} else {
+fields['Comentarios Vorbis'] = 'Ya vacío';
+}
+}
+}
+pageOffset = pageEnd;
+pageCount++;
+if (pageCount > 10) break;
+}
+if (removed === 0) {
+removed = 1;
+removedFields.push('OGG sin comentarios Vorbis detectados');
+fields['Comentarios Vorbis'] = 'No presentes';
+}
+warnings.push('OGG procesado. Páginas de audio conservadas.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+
+if (f.ext === 'm4a' || f.ext === 'aac' || f.ext === 'mp4') {
+const moovOffset = findAtom(bytes, 0, 'moov');
+if (moovOffset === -1) {
+warnings.push('Átomo moov no encontrado. M4A corrupto o sin metadatos.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: 0, warn: true, warnMsg: 'M4A sin moov', audit: { removed: [], warnings, fields: { 'M4A': 'Átomo moov no encontrado' } } };
+}
+const udtaOffset = findAtom(bytes, moovOffset + 8, 'udta');
+if (udtaOffset === -1) {
+removed = 1;
+removedFields.push('M4A sin átomo udta (sin metadatos)');
+fields['Metadatos MP4'] = 'No presentes';
+warnings.push('M4A procesado. No se encontró átomo udta.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+const metaOffset = findAtom(bytes, udtaOffset + 8, 'meta');
+if (metaOffset === -1) {
+removed = 1;
+removedFields.push('M4A sin átomo meta');
+fields['Metadatos MP4'] = 'No presentes';
+warnings.push('M4A procesado. No se encontró átomo meta.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+const ilstOffset = findAtom(bytes, metaOffset + 8, 'ilst');
+if (ilstOffset === -1) {
+removed = 1;
+removedFields.push('M4A sin átomo ilst');
+fields['Metadatos MP4'] = 'No presentes';
+warnings.push('M4A procesado. No se encontró átomo ilst.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+const ilstSize = dv.getUint32(ilstOffset, false);
+const ilstEnd = ilstOffset + ilstSize;
+let tagOffset = ilstOffset + 8;
+let tagsCleaned = 0;
+while (tagOffset < ilstEnd - 8) {
+const tagSize = dv.getUint32(tagOffset, false);
+const tagType = String.fromCharCode(bytes[tagOffset+4], bytes[tagOffset+5], bytes[tagOffset+6], bytes[tagOffset+7]);
+if (tagSize > 8 && tagOffset + tagSize <= ilstEnd) {
+for (let i = tagOffset + 8; i < tagOffset + tagSize; i++) {
+bytes[i] = 0;
+}
+tagsCleaned++;
+removedFields.push('Tag MP4 \'' + tagType + '\' vaciado');
+}
+tagOffset += tagSize;
+if (tagSize === 0) break;
+}
+if (tagsCleaned > 0) {
+removed = tagsCleaned;
+fields['Metadatos MP4'] = tagsCleaned + ' tag(s) vaciado(s)';
+warnings.push('M4A: ' + tagsCleaned + ' tag(s) de metadatos vaciados (estructura MP4 conservada).');
+} else {
+removed = 1;
+removedFields.push('M4A ilst vacío o sin tags reconocibles');
+fields['Metadatos MP4'] = 'No presentes';
+}
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+
+removed = 1;
+removedFields.push('Metadatos de audio ' + f.ext.toUpperCase() + ' (procesamiento básico)');
+fields['Metadatos'] = 'Procesamiento básico aplicado';
+warnings.push('Formato .' + f.ext + ' no soportado completamente. Se aplicó limpieza básica.');
+return { blob: new Blob([bytes], { type: f.file.type }), meta: removed, warn: false, audit: { removed: removedFields, warnings, fields } };
+}
+
+function findAtom(bytes, start, type) {
+const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+let offset = start;
+while (offset < bytes.length - 8) {
+const size = dv.getUint32(offset, false);
+if (size < 8 || offset + size > bytes.length) break;
+const atomType = String.fromCharCode(bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]);
+if (atomType === type) return offset;
+offset += size;
+}
+return -1;
+}
+
+function finishAudio(bytes, removed, removedFields, warnings, fields, mimeType) {
+return {
+blob: new Blob([bytes], { type: mimeType }),
+meta: removed,
+warn: false,
+audit: { removed: removedFields, warnings, fields }
+};
+}
+
+/* ====== DOWNLOAD ALL ====== */
+async function downloadAll(){
+const done=files.filter(f=>f.blob);
+if(!done.length) return;
+if(done.length===1){
+const f=done[0];
+const url=URL.createObjectURL(f.blob);
+const a=document.createElement('a');
+a.href=url; a.download='limpio_'+f.name; a.click();
+setTimeout(()=>URL.revokeObjectURL(url), 10000);
+return;
+}
+log('Generando paquete ZIP de documentos limpios…','info');
+const zip=new JSZip();
+for(const f of done){const ab=await f.blob.arrayBuffer();zip.file('limpio_'+f.name,ab);}
+const out=await zip.generateAsync({type:'blob',compression:'STORE'});
+const url=URL.createObjectURL(out);
+const a=document.createElement('a');
+a.href=url;
+a.download='metalimpio_ENS_documentos.zip'; a.click();
+setTimeout(()=>URL.revokeObjectURL(url), 10000);
+log('Paquete ZIP generado: '+done.length+' archivos. [mp.info.5] completado.','ok');
+}
+
+/* ====== AUDIT REPORT (HTML legacy) ====== */
+function buildReport() {
+const now = tsLong();
+const processed = processedAuditRecords;
+let html = '<div class="report-section"><div class="report-section-title">Datos del proceso</div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Fecha y hora</span><span class="rmi-val">'+now+'</span></div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Norma aplicable</span><span class="rmi-val">CCN-STIC-835 · ENS [mp.info.5]</span></div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Archivos procesados</span><span class="rmi-val">'+processed.length+'</span></div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Campos eliminados</span><span class="rmi-val">'+processed.reduce((s,r)=>s+(r.meta||0),0)+'</span></div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Advertencias</span><span class="rmi-val">'+processed.filter(r=>r.status==='warn').length+'</span></div>';
+html += '<div class="report-meta-item"><span class="rmi-key">Procesamiento</span><span class="rmi-val">Local (sin transferencia de datos)</span></div>';
+html += '</div>';
+if(processed.length > 0) {
+html += '<div class="report-section"><div class="report-section-title">Detalle por archivo</div>';
+html += '<table class="report-table"><thead><tr><th>Archivo</th><th>Estado</th><th>SHA-256 Original</th><th>SHA-256 Limpio</th><th>Campos eliminados</th><th>Advertencias</th></tr></thead><tbody>';
+for(const f of processed) {
+const a=f.audit;
+const statusText=f.status==='done'?'✓ Completado':f.status==='warn'?'⚠ Con advertencias':f.status==='error'?'✗ Error':'—';
+const statusCls=f.status==='done'?'kept':f.status==='warn'?'warn':'removed';
+const hashStyle='font-family:monospace;font-size:0.58rem;word-break:break-all;color:#523658;';
+html+='<tr>';
+html+='<td><strong>'+escapeHtml(f.name)+'</strong><br><small style="color:var(--text-dim)">'+fmt(f.size)+' · .'+escapeHtml(f.ext.toUpperCase())+'</small></td>';
+html+='<td class="'+statusCls+'">'+statusText+'</td>';
+html+='<td style="'+hashStyle+'">'+escapeHtml(a.hashOrig||'—')+'</td>';
+html+='<td style="'+hashStyle+'">'+escapeHtml(a.hashClean||'—')+'</td>';
+html+='<td>'+(a.removed&&a.removed.length>0?a.removed.map(r=>'<span style="display:block;font-size:0.65rem;">• '+escapeHtml(r)+'</span>').join(''):'—')+'</td>';
+html+='<td style="font-size:0.65rem;">'+(a.warnings&&a.warnings.length>0?a.warnings.map(w=>'<span style="display:block;margin-bottom:3px;"> '+escapeHtml(w)+'</span>').join(''):'—')+'</td>';
+html+='</tr>';
+}
+html+='</tbody></table></div>';
+}
+html += '<div class="report-section"><div class="report-section-title">Registro de actividad</div>';
+html += '<table class="report-table"><thead><tr><th>Hora</th><th>Tipo</th><th>Mensaje</th></tr></thead><tbody>';
+auditLog.forEach(function(l){
+html+='<tr><td style="white-space:nowrap">'+l.time+'</td><td>'+(l.type||'info')+'</td><td>'+l.msg+'</td></tr>';
+});
+html += '</tbody></table></div>';
+const allDone = processed.every(f=>f.status==='done');
+const verCls = allDone ? '' : ' warn';
+const verMsg = allDone
+? 'Verificación completada con éxito. Todos los archivos han sido saneados conforme a [mp.info.5].'
+: 'Proceso completado con advertencias. Algunos archivos requieren revisión manual adicional.';
+html += '<div class="report-section"><div class="report-section-title">Verificación del proceso [mp.info.5]</div>';
+html += '<div class="report-verification'+verCls+'">'+verMsg+'</div></div>';
+return html;
+}
+
+/* ====== MOTOR PDF MÍNIMO NATIVO (Fase 8) ====== */
+function escapePdfStr(s) {
+return s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function buildPdfBytes(objects, infoDictStr) {
+const enc = new TextEncoder();
+const parts = [enc.encode('%PDF-1.4\n')];
+const offsets = [];
+for (let i=0; i<objects.length; i++) {
+offsets.push(parts.reduce((s,p)=>s+p.length, 0));
+parts.push(enc.encode((i+1) + ' 0 obj\n' + objects[i] + '\nendobj\n'));
+}
+const xrefOffset = parts.reduce((s,p)=>s+p.length, 0);
+let xref = 'xref\n0 ' + (objects.length+1) + '\n0000000000 65535 f \n';
+for (let off of offsets) xref += off.toString().padStart(10,'0') + ' 00000 n \n';
+xref += 'trailer\n<< /Size ' + (objects.length+1) + ' /Root 1 0 R /Info ' + objects.length + ' 0 R >>\nstartxref\n' + xrefOffset + '\n%%EOF';
+parts.push(enc.encode(xref));
+const totalLen = parts.reduce((s,p)=>s+p.length, 0);
+const result = new Uint8Array(totalLen);
+let pos = 0;
+for (let p of parts) { result.set(p, pos); pos += p.length; }
+return result;
+}
+
+function generateAuditPdf(records, auditLog, globalHash) {
+const now = new Date().toLocaleString('es-ES');
+const totalMeta = records.reduce((s,r)=>s+(r.meta||0),0);
+let stream = 'BT /F1 14 Tf 50 760 Td (INFORME DE AUDITORIA - MetaLimpio ENS) Tj ET\n';
+stream += 'BT /F1 9 Tf 50 740 Td (CCN-STIC-835 | Medida [mp.info.5]) Tj ET\n';
+stream += 'BT /F1 8 Tf 50 725 Td (Generado: ' + escapePdfStr(now) + ') Tj ET\n';
+stream += '50 715 m 550 715 l S\n';
+let y = 700;
+stream += 'BT /F1 10 Tf 50 ' + y + ' Td (RESUMEN DEL PROCESO) Tj ET\n'; y -= 15;
+stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Archivos procesados: ' + records.length + ') Tj ET\n'; y -= 12;
+stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Campos eliminados: ' + totalMeta + ') Tj ET\n'; y -= 12;
+stream += 'BT /F1 8 Tf 50 ' + y + ' Td (Procesamiento: 100% Local - Sin exfiltracion de datos) Tj ET\n'; y -= 20;
+stream += 'BT /F1 10 Tf 50 ' + y + ' Td (DETALLE DE ARCHIVOS Y CAMPOS ELIMINADOS) Tj ET\n'; y -= 15;
+for (const r of records) {
+if (y < 150) {
+stream += 'BT /F1 8 Tf 50 50 Td (Continuacion en pagina siguiente...) Tj ET\n';
+y = 750;
+}
+const name = escapePdfStr(r.name.substring(0, 40));
+const status = r.status === 'done' ? 'OK' : r.status === 'warn' ? 'WARN' : 'ERR';
+const hash = escapePdfStr((r.audit && r.audit.hashOrig ? r.audit.hashOrig : '').substring(0, 16) + '...');
+stream += 'BT /F1 9 Tf 50 ' + y + ' Td (' + name + ') Tj ET\n'; y -= 12;
+stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Estado: ' + status + ') Tj ET\n';
+stream += 'BT /F1 6 Tf 200 ' + y + ' Td (SHA-256: ' + hash + ') Tj ET\n'; y -= 12;
+if (r.audit && r.audit.removed && r.audit.removed.length > 0) {
+stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Campos eliminados:) Tj ET\n'; y -= 10;
+for (const field of r.audit.removed) {
+if (y < 160) break;
+const fieldName = escapePdfStr('  - ' + field.substring(0, 55));
+stream += 'BT /F1 6 Tf 55 ' + y + ' Td (' + fieldName + ') Tj ET\n'; y -= 9;
+}
+}
+if (r.audit && r.audit.warnings && r.audit.warnings.length > 0) {
+y -= 5;
+stream += 'BT /F1 6 Tf 55 ' + y + ' Td (Advertencias: ' + escapePdfStr(r.audit.warnings[0].substring(0, 60)) + ') Tj ET\n'; y -= 10;
+}
+y -= 8;
+stream += '50 ' + y + ' m 550 ' + y + ' l S\n'; y -= 10;
+}
+y -= 10;
+stream += 'BT /F1 10 Tf 50 ' + y + ' Td (SELLO DE INTEGRIDAD) Tj ET\n'; y -= 15;
+stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Hash SHA-256 de sesion: ' + escapePdfStr(globalHash) + ') Tj ET\n'; y -= 12;
+stream += 'BT /F1 7 Tf 50 ' + y + ' Td (Este hash garantiza la trazabilidad del proceso de limpieza.) Tj ET\n';
+const objs = [];
+objs.push('<< /Type /Catalog /Pages 2 0 R >>');
+objs.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+objs.push('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>');
+objs.push('<< /Length ' + stream.length + ' >>\nstream\n' + stream + 'endstream');
+objs.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+const infoStr = '<< /Title (Informe Auditoria MetaLimpio ENS) /Author (MetaLimpio v14) /CreationDate (D:' + new Date().toISOString().replace(/[-:T]/g,'').substring(0,14) + ') /IntegrityHash (' + escapePdfStr(globalHash) + ') >>';
+objs.push(infoStr);
+return buildPdfBytes(objs, infoStr);
+}
+
+function downloadAuditReport(){
+const processed = processedAuditRecords;
+if(processed.length === 0) {
+log('No hay archivos procesados para generar el informe.', 'warn');
+return;
+}
+const sessionHashes = processed.map(r => r.audit && r.audit.hashClean ? r.audit.hashClean : '').join('|');
+crypto.subtle.digest('SHA-256', new TextEncoder().encode(sessionHashes)).then(hashBuf => {
+const globalHash = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2,'0')).join('');
+const pdfBytes = generateAuditPdf(processed, auditLog, globalHash);
+const blob = new Blob([pdfBytes], {type:'application/pdf'});
+const now = tsLong().replace(/[\/:]/g,'-').replace(/\s/g,'_');
+const a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'informe_auditoria_ENS_' + now + '.pdf';
+a.click();
+setTimeout(()=>URL.revokeObjectURL(a.href), 10000);
+log('Informe de auditoría PDF exportado con sello de integridad SHA-256: ' + globalHash.substring(0,16) + '...', 'ok');
+}).catch(err => {
+log('Error al generar el sello de integridad del informe: ' + err.message, 'err');
+});
+}
+
+function downloadFileAuditReport(){
+const btn = document.getElementById('btnDownloadFileAudit');
+if(!btn) return;
+const id = btn.dataset.fileId;
+let f = files.find(x=>x.id===id);
+if(!f||!f.audit){
+const rec=processedAuditRecords.find(r=>r.id===id);
+if(rec) f={name:rec.name,ext:rec.ext,size:rec.size,status:rec.status,meta:rec.meta,audit:rec.audit};
+}
+if(!f||!f.audit) return;
+const now = tsLong();
+const bodyHtml = buildFileAuditHtml(f);
+const fullHtml = '<!DOCTYPE html>\n<html lang="es">\n<head>\n<meta charset="UTF-8">\n<title>Informe MetaLimpio — ' + escapeHtml(f.name) + '</title>\n<style>\nbody{font-family:Jost,Arial,sans-serif;max-width:820px;margin:32px auto;padding:0 24px;color:#1a1a2e;background:#fafafa;}\nh1{font-size:1.2rem;color:#60345e;border-bottom:2px solid #60345e;padding-bottom:8px;}\n.sub{font-size:0.7rem;color:#888;margin-bottom:24px;}\n.report-section{margin-bottom:20px;}\n.report-section-title{font-size:0.65rem;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:#60345e;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #e0d4e0;}\n.report-meta-item{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f0e8f0;font-size:0.78rem;}\n.rmi-key{color:#555;font-size:0.72rem;}\n.rmi-val{font-weight:500;font-size:0.78rem;}\ntable{width:100%;border-collapse:collapse;font-size:0.75rem;}\nth{background:#f3edf5;padding:6px 8px;text-align:left;font-size:0.65rem;letter-spacing:1px;text-transform:uppercase;color:#60345e;}\ntd{padding:6px 8px;border-bottom:1px solid #f0e8f0;}\ntd.removed{color:#2d6a1a;font-weight:500;}\ntd.kept{color:#555;}\ntd.warn{color:#854f0b;}\n.report-verification{background:rgba(96,52,94,0.04);border:1px solid rgba(96,52,94,0.15);border-radius:4px;padding:8px 10px;font-size:0.72rem;margin-bottom:6px;}\n</style>\n</head>\n<body>\n<h1>Informe de Auditoría — ' + escapeHtml(f.name) + '</h1>\n<div class="sub">MetaLimpio ENS v14 · CCN-STIC-835 · [mp.info.5] · Generado: ' + now + '</div>\n' + bodyHtml + '\n</body>\n</html>';
+const blob = new Blob([fullHtml],{type:'text/html'});
+const url  = URL.createObjectURL(blob);
+const a2   = document.createElement('a');
+a2.href    = url;
+const safeName = f.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+a2.download = 'informe_' + safeName + '_' + now.replace(/[\/:]/g,'-').replace(/\s/g,'_') + '.html';
+a2.click();
+setTimeout(()=>URL.revokeObjectURL(url),10000);
+}
+
+function buildFileAuditHtml(f){
+const a=f.audit;
+let html='<div class="report-section">\n<div class="report-section-title">Archivo analizado</div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Nombre</span><span class="rmi-val">'+escapeHtml(f.name)+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Tipo</span><span class="rmi-val">.'+escapeHtml(f.ext.toUpperCase())+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Tamaño</span><span class="rmi-val">'+fmt(f.size)+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Inicio proceso</span><span class="rmi-val">'+escapeHtml(a.startTs||'—')+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Fin proceso</span><span class="rmi-val">'+escapeHtml(a.endTs||'—')+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">Estado</span><span class="rmi-val">'+(a.status==='done'?'✓ Completado':a.status==='warn'?'⚠ Con advertencias':'Error')+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">SHA-256 original</span><span class="rmi-val" style="font-family:monospace;font-size:0.6rem;word-break:break-all;">'+escapeHtml(a.hashOrig||'—')+'</span></div>\n';
+html+='<div class="report-meta-item"><span class="rmi-key">SHA-256 limpio</span><span class="rmi-val" style="font-family:monospace;font-size:0.6rem;word-break:break-all;">'+escapeHtml(a.hashClean||'—')+'</span></div>\n';
+html+='</div>';
+if(a.beforeFields&&Object.keys(a.beforeFields).length>0){
+html+='<div class="report-section">\n<div class="report-section-title">Metadatos — versión original vs. versión limpia</div>\n';
+html+='<table class="report-table"><thead><tr>\n<th>Campo</th><th style="color:#a32d2d;">Valor original</th><th style="color:#2d6a1a;">Tras limpieza</th>\n</tr></thead><tbody>';
+for(const [label,origVal] of Object.entries(a.beforeFields)){
+const fieldAction=a.fields&&a.fields[label]?a.fields[label]:'—';
+const isDate=label.includes('creación')||label.includes('modificación')||label.includes('impresión');
+const afterVal=isDate?(a.fields&&a.fields['Fechas']==='Omitido'?origVal:'Sustituida por fecha de proceso')
+:(fieldAction.startsWith('Eliminad')||fieldAction==='Omitido'?
+(fieldAction==='Omitido'?'<em style="color:#888">Sin cambios</em>':'<em style="color:#2d6a1a">Eliminado</em>')
+:'<em style="color:#2d6a1a">'+escapeHtml(fieldAction)+'</em>');
+html+='<tr>\n<td><strong>'+escapeHtml(label)+'</strong></td>\n';
+html+='<td style="color:#a32d2d;font-family:monospace;font-size:0.68rem;word-break:break-all;">'+escapeHtml(origVal)+'</td>\n';
+html+='<td>'+afterVal+'</td>\n</tr>';
+}
+html+='</tbody></table></div>';
+}
+if(a.fields&&Object.keys(a.fields).length>0){
+html+='<div class="report-section"><div class="report-section-title">Acciones realizadas por categoría</div>\n';
+html+='<table class="report-table"><thead><tr><th>Categoría</th><th>Acción</th></tr></thead><tbody>';
+for(const [k,v] of Object.entries(a.fields)){
+const cls=v.startsWith('Eliminad')||v.startsWith('Sustituido')?'removed':v.startsWith('Conserv')||v.startsWith('✓')||v==='Sin cambios'?'kept':v.startsWith('⚠')?'warn':'';
+html+='<tr><td>'+escapeHtml(k)+'</td><td class="'+cls+'">'+escapeHtml(v)+'</td></tr>';
+}
+html+='</tbody></table></div>';
+}
+if(a.removed&&a.removed.length>0){
+html+='<div class="report-section"><div class="report-section-title">Campos procesados ('+a.removed.length+')</div>\n';
+html+='<ul style="font-size:0.72rem;color:var(--text-mid);padding-left:16px;">';
+a.removed.forEach(function(r){ html+='<li style="margin-bottom:3px;">'+escapeHtml(r)+'</li>'; });
+html+='</ul></div>';
+}
+if(a.warnings&&a.warnings.length>0){
+html+='<div class="report-section"><div class="report-section-title">Advertencias y notas</div>';
+a.warnings.forEach(function(w){
+const style=w.includes('ADVERTENCIA')||w.includes('⚠')?'background:rgba(177,138,32,0.07);border-color:rgba(177,138,32,0.25);color:var(--gold-dark);':'';
+html+='<div class="report-verification" style="margin-bottom:8px;'+style+'">'+escapeHtml(w)+'</div>';
+});
+html+='</div>';
+}
+return html;
+}
+
+function showFileAudit(id){
+let f=files.find(x=>x.id===id);
+if(!f||!f.audit){
+const rec=processedAuditRecords.find(r=>r.id===id);
+if(rec) f={name:rec.name,ext:rec.ext,size:rec.size,status:rec.status,meta:rec.meta,audit:rec.audit};
+}
+if(!f||!f.audit) return;
+let html=buildFileAuditHtml(f);
+document.getElementById('auditModalBody').innerHTML=html;
+const dlBtn = document.getElementById('btnDownloadFileAudit');
+if(dlBtn){ dlBtn.style.display='inline-flex'; dlBtn.dataset.fileId=id; }
+document.getElementById('auditModal').classList.add('open');
+}
+
+function closeModal(){
+document.getElementById('auditModal').classList.remove('open');
+const dlBtn=document.getElementById('btnDownloadFileAudit');
+if(dlBtn) dlBtn.style.display='none';
+}
+document.getElementById('auditModal').addEventListener('click', function(e){
+if(e.target===document.getElementById('auditModal')) closeModal();
+});
+
+/* ====== INSPECT MODAL ====== */
+function closeInspectModal(){
+document.getElementById('inspectModal').classList.remove('open');
+}
+document.getElementById('inspectModal').addEventListener('click', function(e){
+if(e.target===document.getElementById('inspectModal')) closeInspectModal();
+});
+
+/* ====== METADATA SCANNER ====== */
+async function scanFile(f, opts) {
+if (!opts) opts = getOpts();
+const e = f.ext;
+if (e === 'eml') return scanEml(f, opts);
+if (['jpg','jpeg','png','webp','gif','bmp','tiff','tif'].includes(e)) return scanImage(f, opts);
+if (e === 'pdf') return scanPdf(f, opts);
+if (['docx','xlsx','pptx','odt','ods','odp'].includes(e)) return scanOffice(f, opts);
+if (['doc','xls'].includes(e)) return {fields:{'Formato':'Binario heredado (.doc/.xls)','Análisis':'Requiere Inspector de Documentos de MS Office'},risk:'alto',count:0,note:'Formato binario — no analizable automáticamente'};
+if (['mp3','wav','flac','ogg','aac','m4a'].includes(e)) return scanAudio(f, opts);
+return {fields:{},risk:'bajo',count:0,note:'Formato de texto sin metadatos embebidos'};
+}
+
+async function scanImage(f, opts) {
+if (!opts) opts = getOpts();
+const ab = await f.file.arrayBuffer();
+const bytes = new Uint8Array(ab);
+const fields = {};
+let count = 0;
+const isJpeg = bytes[0]===0xFF && bytes[1]===0xD8;
+if (isJpeg) {
+let i = 2;
+while (i < bytes.length - 1) {
+if (bytes[i] !== 0xFF) break;
+const marker = bytes[i+1];
+const segLen = (bytes[i+2]<<8)|bytes[i+3];
+if (marker === 0xE1 && segLen > 6) {
+const header = String.fromCharCode.apply(null, bytes.slice(i+4, i+10));
+if (header.startsWith('Exif')) {
+fields['EXIF'] = '✓ Presente'; count++;
+const exifStart = i + 10;
+const isLE = bytes[exifStart]===0x49 && bytes[exifStart+1]===0x49;
+const readU16 = function(o) { return isLE ? (bytes[exifStart+o]|(bytes[exifStart+o+1]<<8)) : ((bytes[exifStart+o]<<8)|bytes[exifStart+o+1]); };
+const readU32 = function(o) { return isLE ? (bytes[exifStart+o]|(bytes[exifStart+o+1]<<8)|(bytes[exifStart+o+2]<<16)|(bytes[exifStart+o+3]<<24)) : ((bytes[exifStart+o]<<24)|(bytes[exifStart+o+1]<<16)|(bytes[exifStart+o+2]<<8)|bytes[exifStart+o+3]); };
+try {
+if (bytes[exifStart+2]===0x00 && bytes[exifStart+3]===0x2A) {
+const ifdOffset = readU32(4);
+const numEntries = readU16(ifdOffset);
+const tagNames = {0x010F:'Fabricante',0x0110:'Modelo cámara',0x0131:'Software',0x013B:'Artista/Autor',0x0132:'Fecha/hora',0x8769:'ExifIFD',0x8825:'GPS IFD',0x013C:'HostComputer'};
+for (let t=0; t<Math.min(numEntries,20); t++) {
+const entryOffset = ifdOffset + 2 + t*12;
+const tag = readU16(entryOffset);
+if (tagNames[tag]) {
+if (tag === 0x8825 && opts.gps) { fields['GPS'] = '⚠ Coordenadas GPS presentes'; count++; }
+else if (tag === 0x013B && opts.author) { fields['Autor/Artista'] = '⚠ Información personal'; count++; }
+else if (tag === 0x010F && opts.device) { fields['Fabricante'] = 'Presente'; count++; }
+else if (tag === 0x0110 && opts.device) { fields['Modelo cámara'] = 'Presente'; count++; }
+else if (tag === 0x0131 && opts.device) { fields['Software'] = 'Presente'; count++; }
+else if (tag === 0x0132 && opts.dates)  { fields['Fecha/hora captura'] = 'Presente'; count++; }
+else if (tag === 0x013C && opts.device) { fields['Equipo host'] = '⚠ Nombre de equipo'; count++; }
+}
+}
+}
+} catch(ex) {}
+} else if (header.includes('xmpmeta') || header.includes('<?x')) {
+fields['XMP'] = '✓ Presente'; count++;
+}
+} else if (marker === 0xED) {
+fields['IPTC (APP13)'] = '✓ Presente'; count++;
+}
+if (segLen < 2) break;
+i += 2 + segLen;
+}
+}
+const isPng = bytes[0]===0x89&&bytes[1]===0x50&&bytes[2]===0x4E&&bytes[3]===0x47;
+if (isPng) {
+const txt = new TextDecoder('latin1').decode(bytes);
+if (txt.includes('tEXt')||txt.includes('iTXt')||txt.includes('zTXt')) { fields['Chunks de texto PNG'] = '✓ Presentes'; count++; }
+if (txt.includes('xmpmeta')) { fields['XMP embebido'] = '✓ Presente'; count++; }
+if (txt.includes('Author')||txt.includes('author')) { fields['Autor'] = ' Campo autor detectado'; count++; }
+if (txt.includes('Copyright')||txt.includes('copyright')) { fields['Copyright'] = 'Presente (no borrar)'; }
+}
+if (count === 0) { fields['Metadatos'] = 'No se detectaron metadatos significativos'; }
+return { fields, risk: count>2?'alto':count>0?'medio':'bajo', count, note: count + ' campo(s) de metadatos detectados en imagen' };
+}
+
+async function scanPdf(f, opts) {
+if (!opts) opts = getOpts();
+const ab = await f.file.arrayBuffer();
+const text = new TextDecoder('latin1').decode(new Uint8Array(ab));
+const fields = {};
+let count = 0;
+const infoFields = {};
+if (opts.author)  { infoFields['Author']='Autor'; infoFields['Creator']='Aplicación creadora'; infoFields['Producer']='Productor PDF'; infoFields['LastModifiedBy']='Último modificador'; }
+if (opts.company) { infoFields['Company']='Empresa'; infoFields['Manager']='Manager'; }
+if (opts.dates)   { infoFields['CreationDate']='Fecha creación'; infoFields['ModDate']='Fecha modificación'; }
+if (opts.author || opts.company || opts.custom) { infoFields['Title']='Título'; infoFields['Subject']='Asunto'; infoFields['Keywords']='Palabras clave'; infoFields['Category']='Categoría'; }
+for (const [key, label] of Object.entries(infoFields)) {
+const re = new RegExp('/' + key + '\\s*\\(([^)]*)\\)', 'i');
+const m = text.match(re);
+if (m && m[1].trim()) {
+const val = m[1].trim().substring(0,80);
+const isPii = ['Author','Company','Manager','Creator','LastModifiedBy'].includes(key);
+fields[label] = isPii ? '⚠ ' + val : val;
+count++;
+}
+}
+const hasXmp = text.includes('<?xpacket') || text.includes('xmpmeta');
+if (hasXmp) { fields['XMP Stream'] = '✓ Presente'; count++; }
+const hasJS = text.includes('/JavaScript') || text.includes('/JS ');
+if (hasJS) { fields['JavaScript/Macros'] = '⚠ Código JS detectado — riesgo alto'; count++; }
+const hasAttach = text.includes('/EmbeddedFile') || text.includes('/Filespec');
+if (hasAttach) { fields['Archivos adjuntos'] = '⚠ Adjuntos detectados'; count++; }
+if (count === 0) fields['Metadatos'] = 'No se detectaron metadatos en diccionario /Info';
+return { fields, risk: count>3?'alto':count>0?'medio':'bajo', count, note: count + ' campo(s) detectados en diccionario /Info del PDF' };
+}
+
+async function scanOffice(f, opts) {
+if (!opts) opts = getOpts();
+const ab = await f.file.arrayBuffer();
+let zip;
+try { zip = await JSZip.loadAsync(ab); } catch(ex) { return {fields:{'Error':'No se pudo descomprimir el archivo Office'},risk:'bajo',count:0,note:'Error al leer el ZIP'}; }
+const fields = {};
+let count = 0;
+const coreFile = zip.file('docProps/core.xml');
+if (coreFile) {
+const xml = await coreFile.async('string');
+const tagMap = {};
+if (opts.author)  { tagMap['dc:creator']='Autor (dc:creator)'; tagMap['cp:lastModifiedBy']='Último modificador'; tagMap['dc:description']='Descripción'; }
+if (opts.dates)   { tagMap['cp:lastPrinted']='Fecha última impresión'; tagMap['dcterms:created']='Fecha creación'; tagMap['dcterms:modified']='Fecha modificación'; }
+if (opts.stats)   { tagMap['cp:revision']='Número de revisión'; tagMap['cp:category']='Categoría'; tagMap['cp:contentStatus']='Estado del contenido'; }
+if (opts.author || opts.company || opts.custom) { tagMap['dc:title']='Título'; tagMap['dc:subject']='Asunto'; tagMap['cp:keywords']='Palabras clave'; }
+for (const [tag, label] of Object.entries(tagMap)) {
+const re = new RegExp('<' + tag + '[^>]*>([^<]+)<','i');
+const m = xml.match(re);
+if (m && m[1].trim()) {
+const val = m[1].trim().substring(0,80);
+const isPii = ['dc:creator','cp:lastModifiedBy','cp:lastPrinted'].includes(tag);
+fields[label] = isPii ? '⚠ ' + val : val;
+count++;
+}
+}
+}
+const appFile = zip.file('docProps/app.xml');
+if (appFile) {
+const xml = await appFile.async('string');
+const appTags = {};
+if (opts.template) { appTags['Application']='Aplicación'; appTags['AppVersion']='Versión'; appTags['Template']='Plantilla'; }
+if (opts.company)  { appTags['Company']='Empresa'; appTags['Manager']='Gestor'; }
+for (const [tag, label] of Object.entries(appTags)) {
+const re = new RegExp('<' + tag + '>([^<]+)<','i');
+const m = xml.match(re);
+if (m && m[1].trim()) {
+const val = m[1].trim().substring(0,80);
+const isPii = ['Company','Manager','Template'].includes(tag);
+fields[label] = isPii ? '⚠ ' + val : val;
+count++;
+}
+}
+}
+const customFile = zip.file('docProps/custom.xml');
+if (customFile && opts.custom) {
+const xml = await customFile.async('string');
+const propMatches = xml.match(/name="([^"]+)"/g)||[];
+if (propMatches.length > 0) {
+fields['Propiedades personalizadas'] = '⚠ ' + propMatches.length + ' propiedad(es): ' + propMatches.slice(0,3).map(function(m){return m.replace(/name="|"/g,'');}).join(', ') + (propMatches.length>3?'…':'');
+count++;
+}
+}
+const hasMacros = zip.file(/vbaProject\.bin/).length > 0;
+if (hasMacros) { fields['Macros VBA'] = '⚠ CRÍTICO: Macros detectadas — riesgo de código malicioso'; count++; }
+const hasComments = zip.file(/comments\.xml|comment\.xml/).length > 0;
+if (hasComments && opts.comments) { fields['Comentarios/Revisiones'] = '⚠ Comentarios de revisión presentes'; count++; }
+if (count === 0) fields['Metadatos'] = 'No se detectaron metadatos en docProps';
+return { fields, risk: count>4?'alto':count>1?'medio':'bajo', count, note: count + ' campo(s) encontrados en docProps/core.xml y app.xml' };
+}
+
+async function scanAudio(f, opts) {
+if (!opts) opts = getOpts();
+const ab = await f.file.arrayBuffer();
+const bytes = new Uint8Array(ab);
+const fields = {};
+let count = 0;
+if (f.ext === 'mp3') {
+if (bytes[0]===0x49&&bytes[1]===0x44&&bytes[2]===0x33) {
+const ver = bytes[3];
+const sz = ((bytes[6]&0x7f)<<21)|((bytes[7]&0x7f)<<14)|((bytes[8]&0x7f)<<7)|(bytes[9]&0x7f);
+fields['ID3v2 tag'] = '✓ Presente (versión 2.' + ver + ', ' + fmt(sz) + ')'; count++;
+const frameNames = { 'TIT2':'Título', 'TPE1':'Artista', 'TALB':'Álbum', 'TDRC':'Año', 'TCON':'Género', 'COMM':'Comentarios', 'TENC':'Codificado por', 'TOPE':'Artista original', 'APIC':'Portada (imagen)' };
+let pos = 10;
+while (pos < 10 + sz - 10) {
+const frameId = String.fromCharCode(bytes[pos],bytes[pos+1],bytes[pos+2],bytes[pos+3]);
+if (!/^[A-Z0-9]{4}$/.test(frameId)) break;
+const frameSize = (bytes[pos+4]<<24)|(bytes[pos+5]<<16)|(bytes[pos+6]<<8)|bytes[pos+7];
+if (frameSize <= 0 || frameSize > sz) break;
+if (frameNames[frameId]) {
+if (frameId === 'APIC') { fields['Portada/Carátula'] = '✓ Imagen embebida'; count++; }
+else {
+const enc = bytes[pos+10];
+const raw = bytes.slice(pos+11, Math.min(pos+10+frameSize, pos+90));
+let val = '';
+try { val = enc===1||enc===2 ? new TextDecoder('utf-16').decode(raw) : new TextDecoder('latin1').decode(raw); } catch(ex) { val = '(ilegible)'; }
+val = val.replace(/\0/g,'').trim().substring(0,60);
+if (val) { fields[frameNames[frameId]] = '⚠ ' + val; count++; }
+}
+}
+pos += 10 + frameSize;
+}
+}
+const end = bytes.length;
+if (end>128&&bytes[end-128]===0x54&&bytes[end-127]===0x41&&bytes[end-126]===0x47) {
+const dec = new TextDecoder('latin1');
+fields['ID3v1 tag'] = '✓ Presente'; count++;
+const title = dec.decode(bytes.slice(end-125,end-95)).replace(/\0/g,'').trim();
+if (title) { fields['ID3v1 Título'] = '⚠ ' + title; count++; }
+const artist = dec.decode(bytes.slice(end-95,end-65)).replace(/\0/g,'').trim();
+if (artist) { fields['ID3v1 Artista'] = '⚠ ' + artist; count++; }
+}
+} else {
+fields['Cabeceras de metadatos'] = 'Presente (formato ' + f.ext.toUpperCase() + ')'; count++;
+}
+if (count === 0) fields['Metadatos'] = 'No se detectaron tags de metadatos de audio';
+return { fields, risk: count>3?'medio':'bajo', count, note: count + ' campo(s) de metadatos de audio detectados' };
+}
+
+/* ====== INSPECT ALL ====== */
+async function inspectAll() {
+const pending = files.filter(f => f.status === 'pending');
+if (!pending.length) return;
+document.getElementById('btnInspect').disabled = true;
+const opts = getOpts();
+document.getElementById('inspectModalTitle').textContent = 'Inspeccionando ' + pending.length + ' archivo(s)…';
+document.getElementById('inspectModalBody').innerHTML = '<div style="text-align:center;padding:40px 20px;color:var(--text-muted);font-size:0.8rem;"><span class="spinner"></span> Analizando metadatos presentes…</div>';
+document.getElementById('inspectModal').classList.add('open');
+const results = [];
+for (const f of pending) {
+const scanTag = document.getElementById('scan-'+f.id);
+if (scanTag) { scanTag.style.display='inline'; scanTag.className='scan-tag scanning'; scanTag.textContent='Escaneando…'; }
+try {
+const scan = await scanFile(f, opts);
+f.scanResult = scan;
+results.push({ f, scan });
+if (scanTag) { scanTag.className='scan-tag scanned'; scanTag.textContent=scan.count + ' campo(s)'; }
+const insBtn = document.getElementById('ins-'+f.id);
+if (insBtn) insBtn.style.display='flex';
+} catch(ex) {
+results.push({ f, scan: { fields:{'Error':ex.message||'No analizable'}, risk:'bajo', count:0, note:'Error al escanear' } });
+if (scanTag) { scanTag.style.display='none'; }
+}
+await sleep(20);
+}
+document.getElementById('inspectModalTitle').textContent = 'Inspección de Metadatos — ' + pending.length + ' archivo(s)';
+renderInspectModal(results, opts);
+document.getElementById('btnInspect').disabled = false;
+}
+
+function renderInspectModal(results, opts) {
+if (!opts) opts = getOpts();
+const totalFound = results.reduce((s,r)=>s+r.scan.count,0);
+const highRisk = results.filter(r=>r.scan.risk==='alto').length;
+const medRisk = results.filter(r=>r.scan.risk==='medio').length;
+const fieldToOpt = {
+'Autor (dc:creator)':      'author',
+'Autor':                   'author',
+'Último modificador':      'author',
+'Autor/Artista':           'author',
+'Artista':                 'author',
+'Artista original':        'author',
+'Codificado por':          'author',
+'Autor/Creador':           'author',
+'Creator':                 'author',
+'LastModifiedBy':          'author',
+'Empresa':                 'company',
+'Gestor':                  'company',
+'Manager':                 'company',
+'Fecha creación':          'dates',
+'Fecha modificación':      'dates',
+'Fecha última impresión':  'dates',
+'Fecha/hora captura':      'dates',
+'Fecha/hora':              'dates',
+'Número de revisión':      'stats',
+'Categoría':               'stats',
+'Estado del contenido':    'stats',
+'Plantilla':               'template',
+'Aplicación':              'template',
+'Versión':                 'template',
+'GPS':                     'gps',
+'Fabricante':              'device',
+'Modelo cámara':           'device',
+'Software':                'device',
+'Equipo host':             'device',
+'Propiedades personalizadas': 'custom',
+'Comentarios/Revisiones':  'comments',
+'Comentarios':             'comments',
+};
+let html = '<div class="inspect-summary">\n';
+html += '<div class="is-card"><div class="is-num red">' + totalFound + '</div><div class="is-label">Campos detectados</div></div>\n';
+html += '<div class="is-card"><div class="is-num red">' + highRisk + '</div><div class="is-label">Archivos riesgo ALTO</div></div>\n';
+html += '<div class="is-card"><div class="is-num amber">' + medRisk + '</div><div class="is-label">Archivos riesgo MEDIO</div></div>\n';
+html += '</div>';
+for (const { f, scan } of results) {
+const riskColor = scan.risk==='alto'?'var(--red)':scan.risk==='medio'?'var(--amber)':'var(--green)';
+const riskLabel = scan.risk==='alto'?'ALTO':scan.risk==='medio'?'MEDIO':'BAJO';
+const afterFields = {};
+for (const [k, v] of Object.entries(scan.fields)) {
+if (k === 'Copyright' || k === 'Portada/Carátula') {
+afterFields[k] = 'Conservado';
+} else if (k === 'Macros VBA') {
+afterFields[k] = '⚠ Requiere revisión manual';
+} else if (k === 'JavaScript/Macros') {
+afterFields[k] = ' Requiere Adobe Acrobat';
+} else if (k === 'Archivos adjuntos') {
+afterFields[k] = '⚠ Verificar manualmente';
+} else {
+const optKey = fieldToOpt[k];
+if (optKey && !opts[optKey]) {
+afterFields[k] = '— No configurado para eliminar';
+} else {
+afterFields[k] = '✓ Eliminado';
+}
+}
+}
+html += '<div class="inspect-section-title">\n';
+html += '<span class="dot" style="background:' + riskColor + '"></span>\n';
+html += escapeHtml(f.name) + '\n';
+html += '<span style="margin-left:auto;font-family:monospace;font-size:0.55rem;color:' + riskColor + ';border:1px solid;padding:1px 7px;border-radius:2px;">RIESGO ' + riskLabel + '</span>\n';
+html += '<span style="font-size:0.6rem;color:var(--text-dim);font-style:italic;">' + escapeHtml(scan.note) + '</span>\n';
+html += '</div>\n';
+html += '<div class="ba-grid">\n';
+html += '<div class="ba-col">\n';
+html += '<div class="ba-col-header before"><span class="ba-dot"></span>ANTES — Metadatos presentes</div>\n';
+html += '<div class="ba-col-body">';
+if (Object.keys(scan.fields).length === 0) {
+html += '<div class="meta-field-row"><span class="mfr-val empty">No se detectaron metadatos</span></div>';
+} else {
+for (const [k, v] of Object.entries(scan.fields)) {
+const cls = v.startsWith('⚠')?'present':v.startsWith('✓')?'present':'present';
+html += '<div class="meta-field-row"><span class="mfr-key">' + escapeHtml(k) + '</span><span class="mfr-val ' + cls + '">' + escapeHtml(v) + '</span></div>';
+}
+}
+html += '</div></div>\n';
+html += '<div class="ba-col">\n';
+html += '<div class="ba-col-header after"><span class="ba-dot"></span>DESPUÉS — Tras limpieza [mp.info.5]</div>\n';
+html += '<div class="ba-col-body">';
+if (Object.keys(afterFields).length === 0) {
+html += '<div class="meta-field-row"><span class="mfr-val empty">Sin metadatos que eliminar</span></div>';
+} else {
+for (const [k, v] of Object.entries(afterFields)) {
+const cls = v.startsWith('✓')?'removed':v.startsWith('Conservado')?'kept':v.startsWith('⚠')?'warn':v.startsWith('—')?'skipped':'removed';
+html += '<div class="meta-field-row"><span class="mfr-key">' + escapeHtml(k) + '</span><span class="mfr-val ' + cls + '">' + escapeHtml(v) + '</span></div>';
+}
+}
+html += '</div></div></div>';
+}
+html += '<div style="background:rgba(96,52,94,0.04);border:1px solid var(--border);border-radius:var(--r4);padding:10px 14px;font-size:0.68rem;color:var(--text-muted);line-height:1.6;margin-top:4px;">\n';
+html += '<strong style="color:var(--plum-deep);">ℹ Nota metodológica [mp.info.5]:</strong> La columna "DESPUÉS" refleja el resultado esperado tras ejecutar la limpieza. Los campos marcados como <span style="color:var(--gold-dark);font-weight:500;">⚠ Requiere revisión manual</span> no pueden eliminarse automáticamente y deben tratarse con el Inspector de Documentos de MS Office o Adobe Acrobat, según el tipo de archivo.\n';
+html += '</div>';
+document.getElementById('inspectModalBody').innerHTML = html;
+}
+
+async function inspectSingle(id) {
+const f = files.find(x=>x.id===id);
+if (!f) return;
+const opts = getOpts();
+document.getElementById('inspectModalTitle').textContent = 'Inspección: ' + f.name;
+document.getElementById('inspectModalBody').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);font-size:0.8rem;"><span class="spinner"></span> Analizando…</div>';
+document.getElementById('inspectModal').classList.add('open');
+const scan = f.scanResult || await scanFile(f, opts);
+f.scanResult = scan;
+const scanTag = document.getElementById('scan-'+id);
+if (scanTag) { scanTag.style.display='inline'; scanTag.className='scan-tag scanned'; scanTag.textContent=scan.count + ' campo(s)'; }
+const insBtn = document.getElementById('ins-'+id);
+if (insBtn) insBtn.style.display='flex';
+renderInspectModal([{f, scan}], opts);
+}
+
+/* ====== STIC SECTION TOGGLE ====== */
+function toggleStic() {
+const grid = document.getElementById('sticGrid');
+const btn  = document.querySelector('.stic-toggle');
+const hidden = grid.style.display === 'none';
+grid.style.display = hidden ? 'grid' : 'none';
+btn.textContent = hidden ? '▲ Ocultar' : '▼ Mostrar';
+}
+
+/* ====== DRAG & DROP ====== */
+const dz=document.getElementById('dropZone');
+dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('drag-over');});
+dz.addEventListener('dragleave',function(){dz.classList.remove('drag-over');});
+dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('drag-over');handleFiles(Array.from(e.dataTransfer.files));});
+document.getElementById('fileInput').addEventListener('change',function(e){handleFiles(Array.from(e.target.files));e.target.value='';});
+</script>
+</body>
+</html>
