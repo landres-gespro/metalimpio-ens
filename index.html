@@ -1951,7 +1951,7 @@ dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-ove
 dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag-over');handleFiles(Array.from(e.dataTransfer.files));});
 document.getElementById('fileInput').addEventListener('change',e=>{handleFiles(Array.from(e.target.files));e.target.value='';});
-</script>
+
 </body>
 </html>
 /* ── LEGACY (DOC/XLS) ── */
