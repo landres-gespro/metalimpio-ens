@@ -2233,15 +2233,16 @@ async function sha256hex(arrayBuffer) {
 const MAX_FILE_SIZE = 150 * 1024 * 1024; // 150 MB
 
 function getExtClass(e) {
-  const m={pdf:'ext-pdf',docx:'ext-docx',doc:'ext-docx',xlsx:'ext-xlsx',xls:'ext-xlsx',
-            pptx:'ext-pptx',ppt:'ext-pptx',
-            jpg:'ext-jpg',jpeg:'ext-jpeg',png:'ext-png',gif:'ext-gif',webp:'ext-webp',
-            tiff:'ext-jpg',tif:'ext-jpg',bmp:'ext-jpg',
-            mp3:'ext-mp3',wav:'ext-wav',flac:'ext-flac',ogg:'ext-mp3',aac:'ext-mp3',m4a:'ext-mp3',
-            odt:'ext-odt',ods:'ext-ods',odp:'ext-odp'};
-  return m[e]||'ext-other';
+const m={pdf:'ext-pdf',docx:'ext-docx',doc:'ext-docx',xlsx:'ext-xlsx',xls:'ext-xlsx',
+pptx:'ext-pptx',ppt:'ext-pptx',
+jpg:'ext-jpg',jpeg:'ext-jpeg',png:'ext-png',gif:'ext-gif',webp:'ext-webp',
+tiff:'ext-jpg',tif:'ext-jpg',bmp:'ext-jpg',
+mp3:'ext-mp3',wav:'ext-wav',flac:'ext-flac',ogg:'ext-mp3',aac:'ext-mp3',m4a:'ext-mp3',
+odt:'ext-odt',ods:'ext-ods',odp:'ext-odp',
+eml:'ext-eml'};
+return m[e]||'ext-other';
 }
-
+  
 /* ====== LOGGING ====== */
 function log(msg, type='') {
   const body = document.getElementById('logBody');
@@ -3399,7 +3400,7 @@ async function scanAudio(f, opts) {
           if (frameId === 'APIC') { fields['Portada/Carátula'] = '✓ Imagen embebida'; count++; }
           else {
             const enc = bytes[pos+10];
-            const raw = bytes.slice(pos+11, Math.min(pos+10+frameSize, pos+10+frameSize, pos+90));
+            const raw = bytes.slice(pos+11, Math.min(pos+10+frameSize, pos+90));
             let val = '';
             try { val = enc===1||enc===2 ? new TextDecoder('utf-16').decode(raw) : new TextDecoder('latin1').decode(raw); } catch(ex) { val = '(ilegible)'; }
             val = val.replace(/\0/g,'').trim().substring(0,60);
